@@ -1,0 +1,30 @@
+name = "KerrUnboundWaveforms"
+uuid = "10004602-e2ee-4ce0-bfe0-9375e949b00a"
+authors = ["Plan B collaboration"]
+
+[deps]
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+HypergeometricFunctions = "34004b35-14d8-5ef3-9330-4cdb6864b03a"
+Interpolations = "a98d9a8b-a2ab-59e6-89dd-64a1c18fca59"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+OrdinaryDiffEqRosenbrock = "43230ef6-c299-4910-a778-202eb28ce4ce"
+OrdinaryDiffEqVerner = "79d7bb75-1356-48c1-b8c0-6832512096c2"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+SpinWeightedSpheroidalHarmonics = "680e17a6-2a17-48fd-ae01-e2b5a643bef0"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[compat]
+ForwardDiff = "=0.10.39"
+HypergeometricFunctions = "=0.3.28"
+Interpolations = "=0.15.1"
+OrdinaryDiffEqRosenbrock = "=1.31.1"
+OrdinaryDiffEqVerner = "=1.14.0"
+PrecompileTools = "=1.2.1"
+SciMLBase = "=2.155.1"
+SpecialFunctions = "=2.8.0"
+SpinWeightedSpheroidalHarmonics = "=1.3.0"
+StaticArrays = "=1.9.18"
+julia = "1.10"
