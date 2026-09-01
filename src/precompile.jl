@@ -17,7 +17,7 @@ using PrecompileTools: @compile_workload
         r_outer_floor=400.0,
         nsteps_per_branch=2000,
         asymptotic_tail_correction=true,
-        asymptotic_match_phase=200.0,
+        asymptotic_match_phase=20.0,
         source_tail_order=3,
         green_tail_correction=true,
         scattering_green_tail_slow_order=3,

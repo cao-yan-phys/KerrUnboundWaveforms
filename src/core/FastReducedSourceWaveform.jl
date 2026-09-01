@@ -66,12 +66,33 @@ effective_source_grid(cfg::FastReducedWaveformConfig) =
 effective_asymptotic_tail_correction(cfg::FastReducedWaveformConfig) =
     cfg.asymptotic_tail_correction
 
+function scattering_green_tail_phase_rate(cfg::FastReducedWaveformConfig)
+    momentum = sqrt(cfg.energy^2 - 1)
+    momentum > 0 || error("a scattering Green tail requires energy greater than one")
+    abs(cfg.omega) > 0 || error("a scattering Green tail requires nonzero frequency")
+    return abs(cfg.omega) / (momentum * (cfg.energy + momentum))
+end
+
 function effective_source_r_outer(cfg::FastReducedWaveformConfig)
     cfg.r_outer_floor >= 0 || error("r_outer_floor must be nonnegative")
     cfg.r_outer_min >= cfg.r_outer_floor ||
         error("r_outer_min must be at least r_outer_floor")
-    if cfg.orbit_kind in ("scattering", "plunge") &&
+    if cfg.orbit_kind == "scattering" &&
        effective_asymptotic_tail_correction(cfg)
+        cfg.asymptotic_match_phase > 0 ||
+            error("asymptotic_match_phase must be positive")
+        required_outer = max(
+            cfg.r_outer_floor,
+            cfg.asymptotic_match_phase /
+            scattering_green_tail_phase_rate(cfg),
+        )
+        cfg.r_outer_min >= required_outer * (1 - 1e-12) || error(
+            "r_outer_min=$(cfg.r_outer_min) is too small for the scattering " *
+            "Green tail; require at least $required_outer",
+        )
+        return required_outer
+    elseif cfg.orbit_kind == "plunge" &&
+           effective_asymptotic_tail_correction(cfg)
         cfg.asymptotic_match_phase > 0 ||
             error("asymptotic_match_phase must be positive")
         return max(cfg.r_outer_floor, min(

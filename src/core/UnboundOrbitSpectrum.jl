@@ -965,7 +965,13 @@ function requested_fixed_modes(cfg::UnboundSpectrumConfig)
 end
 
 function choose_production_outer(cfg, window)
-    phase_outer = cfg.asymptotic_match_phase / window.omega_min
+    phase_rate = if cfg.orbit_kind == "scattering"
+        momentum = sqrt(cfg.energy^2 - 1)
+        window.omega_min / (momentum * (cfg.energy + momentum))
+    else
+        window.omega_min
+    end
+    phase_outer = cfg.asymptotic_match_phase / phase_rate
     orbit_outer = probe_outer_radius(cfg)
     phase_limited = min(phase_outer, cfg.r_outer_cap)
     return max(orbit_outer, phase_limited), phase_outer > cfg.r_outer_cap

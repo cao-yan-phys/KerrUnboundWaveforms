@@ -702,6 +702,47 @@ function reverse_oscillatory_integrals3!(result1, result2, result3,
     return nothing
 end
 
+function reverse_phase_aware_integral!(result, x, values, phase_values;
+                                       phase_arguments=nothing,
+                                       scale=nothing, moment=nothing)
+    n = length(x)
+    n == length(values) == length(phase_values) == length(result) ||
+        error("phase-aware reverse-integral array lengths differ")
+    phase_arguments === nothing || n == length(phase_arguments) ||
+        error("phase-aware reverse-integral phase lengths differ")
+    result[n] = 0.0 + 0.0im
+    @inbounds for i in (n - 1):-1:1
+        value0 = scaled_integrand_value(values, scale, moment, i)
+        value1 = scaled_integrand_value(values, scale, moment, i + 1)
+        amplitude0 = value0 * conj(phase_values[i])
+        amplitude1 = value1 * conj(phase_values[i + 1])
+        if phase_arguments === nothing
+            phase_increment = angle(phase_values[i + 1] * conj(phase_values[i]))
+        else
+            phase_increment = phase_arguments[i + 1] - phase_arguments[i]
+        end
+        width = x[i + 1] - x[i]
+        phase_factor = phase_values[i]
+        phase_ratio = phase_values[i + 1] * conj(phase_factor)
+        if abs(phase_increment) < 1e-6
+            segment = 0.5 * width * (
+                phase_factor * amplitude0 + phase_values[i + 1] * amplitude1
+            )
+        else
+            inverse_i_phase = inv(1im * phase_increment)
+            zeroth_moment = (phase_ratio - 1) * inverse_i_phase
+            first_moment = phase_ratio * inverse_i_phase +
+                            (phase_ratio - 1) / phase_increment^2
+            segment = width * phase_factor * (
+                amplitude0 * zeroth_moment +
+                (amplitude1 - amplitude0) * first_moment
+            )
+        end
+        result[i] = result[i + 1] + segment
+    end
+    return result
+end
+
 function interp_complex(xs, ys, x)
     x <= xs[1] && return ys[1]
     x >= xs[end] && return ys[end]
@@ -860,13 +901,33 @@ function mathcalW_channel_from_values!(W, scratch1, scratch2, scratch3,
                                        integration_x=nothing,
                                        dr_dx=nothing,
                                        phase_values=nothing,
+                                       phase_arguments=nothing,
                                        tail_order::Int=3)
     x = integration_x === nothing ? r : integration_x
     jac = dr_dx
-    reverse_oscillatory_integrals3!(
-        scratch1, scratch2, scratch3, x, v1, v2;
-        scale=jac, moment=r,
-    )
+    if phase_values === nothing
+        reverse_oscillatory_integrals3!(
+            scratch1, scratch2, scratch3, x, v1, v2;
+            scale=jac, moment=r,
+        )
+    else
+        if v1 === nothing
+            fill!(scratch1, 0.0 + 0.0im)
+        else
+            reverse_phase_aware_integral!(
+                scratch1, x, v1, phase_values;
+                phase_arguments=phase_arguments, scale=jac,
+            )
+        end
+        reverse_phase_aware_integral!(
+            scratch2, x, v2, phase_values;
+            phase_arguments=phase_arguments, scale=jac,
+        )
+        reverse_phase_aware_integral!(
+            scratch3, x, v2, phase_values;
+            phase_arguments=phase_arguments, scale=jac, moment=r,
+        )
+    end
 
     if !asymptotic_tail_correction
         @inbounds @simd for i in eachindex(W)
@@ -925,6 +986,7 @@ function mathcalW_channel_from_values(r, v0, v1, v2, chi_prime_input;
                                       integration_x=nothing,
                                       dr_dx=nothing,
                                       phase_values=nothing,
+                                      phase_arguments=nothing,
                                       tail_order::Int=3)
     W = Vector{ComplexF64}(undef, length(r))
     scratch1 = similar(W)
@@ -937,6 +999,7 @@ function mathcalW_channel_from_values(r, v0, v1, v2, chi_prime_input;
         integration_x=integration_x,
         dr_dx=dr_dx,
         phase_values=phase_values,
+        phase_arguments=phase_arguments,
         tail_order=tail_order,
     )
     return (W=W, inner_m0=moments.inner_m0, inner_m1=moments.inner_m1)
@@ -959,17 +1022,18 @@ end
 
 function table_points(traj::PieceTrajectory, r_turn, cfg::EquatorialScatteringConfig)
     points = points_ordered_by_radius(traj.points)
-    if !cfg.regularize_turn || !isfinite(r_turn)
-        return points
+    filtered = if !cfg.regularize_turn || !isfinite(r_turn)
+        points
+    else
+        min_delta = 1e-12 * max(1.0, abs(r_turn))
+        first_regular = findfirst(p -> p.r > r_turn + min_delta, points)
+        first_regular === nothing &&
+            error("no points outside the regularized radial turn")
+        @view points[first_regular:end]
     end
-
-    min_delta = 1e-12 * max(1.0, abs(r_turn))
-    first_regular = findfirst(p -> p.r > r_turn + min_delta, points)
-    first_regular === nothing &&
-        error("no points outside the regularized radial turn")
-    filtered = @view points[first_regular:end]
     length(filtered) >= 4 ||
-        error("not enough points outside the regularized radial turn; increase nsteps_per_branch")
+        error("not enough points outside the regularized turn; increase nsteps_per_branch")
+
     return filtered
 end
 
@@ -1108,6 +1172,7 @@ function build_piece_table_from_integrands(kerr::KerrParams, constants::Geodesic
         integration_x=integration_x,
         dr_dx=dr_dx,
         phase_values=phase_values,
+        phase_arguments=phase_arguments,
         tail_order=cfg.asymptotic_tail_order,
     )
     nm_solution = mathcalW_channel_from_values!(
@@ -1117,6 +1182,7 @@ function build_piece_table_from_integrands(kerr::KerrParams, constants::Geodesic
         integration_x=integration_x,
         dr_dx=dr_dx,
         phase_values=phase_values,
+        phase_arguments=phase_arguments,
         tail_order=cfg.asymptotic_tail_order,
     )
     mm_solution = mathcalW_channel_from_values!(
@@ -1126,6 +1192,7 @@ function build_piece_table_from_integrands(kerr::KerrParams, constants::Geodesic
         integration_x=integration_x,
         dr_dx=dr_dx,
         phase_values=phase_values,
+        phase_arguments=phase_arguments,
         tail_order=cfg.asymptotic_tail_order,
     )
 
