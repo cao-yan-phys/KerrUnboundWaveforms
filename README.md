@@ -33,4 +33,10 @@ save(result, "output")
 
 ## 例子
 
-![球谐模式 (2,2) 与 (2,-2) 的能谱](examples/generic_kerr_scattering_spectrum.png)
+类光无穷远处的能流：
+
+![](examples/generic_kerr_scattering_spectrum.png?v=20260904)
+
+外视界上的能流：
+
+![](examples/horizon_m2_signed_spectrum.png?v=20260904)

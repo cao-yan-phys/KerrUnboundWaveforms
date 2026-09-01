@@ -1,6 +1,6 @@
 name = "KerrUnboundWaveforms"
 uuid = "10004602-e2ee-4ce0-bfe0-9375e949b00a"
-authors = ["Plan B collaboration"]
+authors = ["cao-yan-phys"]
 version = "0.1.0"
 
 [deps]
