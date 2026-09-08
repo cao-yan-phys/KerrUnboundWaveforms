@@ -47,6 +47,7 @@ Base.@kwdef mutable struct EquatorialScatteringConfig
     allow_theta_turns::Bool = false
     npoints::Int = 1001
     nsteps_per_branch::Int = 1800
+    plunge_inner_rstar_spacing::Float64 = 0.1
     out::String = joinpath(@__DIR__, "..", "output", "equatorial_scattering", "source.csv")
     diagnostics_out::String = ""
 end
@@ -79,6 +80,8 @@ function validate_source_config(cfg::EquatorialScatteringConfig)
     cfg.omega == 0 && error("omega=0 is not supported by the external Green driver")
     cfg.npoints >= 2 || error("npoints must be at least 2")
     cfg.nsteps_per_branch >= 10 || error("nsteps_per_branch must be at least 10")
+    cfg.plunge_inner_rstar_spacing > 0 ||
+        error("plunge_inner_rstar_spacing must be positive")
     cfg.turn_buffer > 0 || error("turn_buffer must be positive")
     cfg.asymptotic_match_phase > 0 ||
         error("asymptotic_match_phase must be positive")
@@ -136,17 +139,18 @@ end
 function plunge_composite_radial_nodes(kerr::KerrParams,
                                        piece::OrbitPiece,
                                        nsteps::Int;
-                                       energy::Float64=1.0)
+                                       energy::Float64=1.0,
+                                       inner_rstar_spacing::Float64=0.1)
     piece.radial_sign < 0 || error("plunge composite nodes require an incoming piece")
     piece.r_start > piece.r_stop || error("plunge radii must decrease")
     r_cut = min(200.0, piece.r_start)
     if piece.r_start <= 200.0
         rs_start = KerrGeometry.rstar_from_r(kerr.a, piece.r_start)
         rs_stop = KerrGeometry.rstar_from_r(kerr.a, piece.r_stop)
-        required_steps = ceil(Int, (rs_start - rs_stop) / 0.1)
+        required_steps = ceil(Int, (rs_start - rs_stop) / inner_rstar_spacing)
         nsteps >= required_steps || error(
             "plunge orbit needs at least $required_steps steps to keep " *
-            "Delta rstar <= 0.1 through r=$(piece.r_start); received $nsteps",
+            "Delta rstar <= $inner_rstar_spacing through r=$(piece.r_start); received $nsteps",
         )
         nodes = Float64[
             KerrGeometry.r_from_rstar(kerr.a, rs)
@@ -161,7 +165,7 @@ function plunge_composite_radial_nodes(kerr::KerrParams,
 
     rs_cut = KerrGeometry.rstar_from_r(kerr.a, r_cut)
     rs_stop = KerrGeometry.rstar_from_r(kerr.a, piece.r_stop)
-    inner_steps = max(2, ceil(Int, (rs_cut - rs_stop) / 0.1))
+    inner_steps = max(2, ceil(Int, (rs_cut - rs_stop) / inner_rstar_spacing))
     outer_steps = nsteps - inner_steps
     outer_steps >= 2 || error(
         "plunge orbit needs at least $(inner_steps + 2) steps to keep " *
@@ -215,7 +219,9 @@ function build_scattering_orbit_cache(cfg::EquatorialScatteringConfig)
     )
     radial_nodes = kind === :plunge ?
         [plunge_composite_radial_nodes(
-             kerr, piece, cfg.nsteps_per_branch; energy=cfg.energy,
+             kerr, piece, cfg.nsteps_per_branch;
+             energy=cfg.energy,
+             inner_rstar_spacing=cfg.plunge_inner_rstar_spacing,
          )
          for piece in pieces] : nothing
     trajectories = integrate_orbit_pieces(

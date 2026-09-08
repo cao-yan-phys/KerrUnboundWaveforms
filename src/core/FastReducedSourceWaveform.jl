@@ -43,6 +43,7 @@ Base.@kwdef mutable struct FastReducedWaveformConfig
     r_outer_min::Float64 = 80.0
     r_outer_floor::Float64 = 0.0
     nsteps_per_branch::Int = DEFAULT_SOURCE_STEPS_PER_BRANCH
+    plunge_inner_rstar_spacing::Float64 = 0.1
     asymptotic_tail_correction::Bool = true
     asymptotic_match_phase::Float64 = DEFAULT_ASYMPTOTIC_MATCH_PHASE
     source_tail_order::Int = 3
@@ -158,6 +159,7 @@ function source_config(cfg::FastReducedWaveformConfig; orbit_cache::Bool=false)
         r_outer_min=r_outer,
         npoints=max(cfg.npoints, 2),
         nsteps_per_branch=cfg.nsteps_per_branch,
+        plunge_inner_rstar_spacing=cfg.plunge_inner_rstar_spacing,
         allow_theta_turns=cfg.allow_theta_turns,
         asymptotic_tail_correction=effective_asymptotic_tail_correction(cfg),
         asymptotic_match_phase=cfg.asymptotic_match_phase,
@@ -169,14 +171,55 @@ function build_fast_reduced_orbit_cache(cfg::FastReducedWaveformConfig)
     return build_scattering_orbit_cache(source_config(cfg; orbit_cache=true))
 end
 
-function source_phase_increment(built)
-    increments = Float64[]
-    for table in built.tables
+function source_phase_increment_details(built)
+    maximum_increment = -Inf
+    maximum_table = 0
+    maximum_index = 0
+    for (table_index, table) in enumerate(built.tables)
         length(table.phase_arguments) >= 2 || continue
-        push!(increments, maximum(abs.(diff(table.phase_arguments))))
+        increment, segment_index = findmax(abs.(diff(table.phase_arguments)))
+        if increment > maximum_increment
+            maximum_increment = increment
+            maximum_table = table_index
+            maximum_index = segment_index
+        end
     end
-    isempty(increments) && error("source table has no phase increments")
-    return maximum(increments)
+    maximum_table != 0 || error("source table has no phase increments")
+    return maximum_increment, maximum_table, maximum_index
+end
+
+source_phase_increment(built) = first(source_phase_increment_details(built))
+
+function locally_refine_plunge_inner_grid!(active, cache, built,
+                                            table_index::Int,
+                                            segment_index::Int,
+                                            increment::Float64)
+    active.orbit_kind == "plunge" || return false
+    table = built.tables[table_index]
+    r_right = table.r[segment_index + 1]
+    r_right <= 200.0 * (1 + 1.0e-12) || return false
+    any(piece -> piece.r_start > 200.0 && piece.r_stop < 200.0, cache.pieces) ||
+        return false
+    factor = ceil(Int, increment / SOURCE_PHASE_INCREMENT_LIMIT)
+    factor > 1 || return false
+    active.plunge_inner_rstar_spacing /= factor
+    active.nsteps_per_branch += sum(
+        max(2, ceil(Int, (
+            KerrGeometry.rstar_from_r(cache.kerr.a, min(200.0, piece.r_start)) -
+            KerrGeometry.rstar_from_r(cache.kerr.a, piece.r_stop)
+        ) / active.plunge_inner_rstar_spacing)) -
+        max(2, ceil(Int, (
+            KerrGeometry.rstar_from_r(cache.kerr.a, min(200.0, piece.r_start)) -
+            KerrGeometry.rstar_from_r(cache.kerr.a, piece.r_stop)
+        ) / (active.plunge_inner_rstar_spacing * factor)))
+        for piece in cache.pieces if piece.r_start > 200.0 && piece.r_stop < 200.0
+    )
+    active.nsteps_per_branch <= MAX_AUTOMATIC_SOURCE_STEPS || error(
+        "automatic local plunge source refinement requires " *
+        "$(active.nsteps_per_branch) steps per branch, above the safe limit " *
+        "$MAX_AUTOMATIC_SOURCE_STEPS",
+    )
+    return true
 end
 
 function resolved_fast_reduced_source(cfg::FastReducedWaveformConfig;
@@ -190,11 +233,18 @@ function resolved_fast_reduced_source(cfg::FastReducedWaveformConfig;
                 build_scattering_orbit_cache(source_config(active; orbit_cache=true)) :
                 candidate_cache
         built = build_scattering_source_from_cache(scfg, cache)
-        increment = source_phase_increment(built)
+        increment, table_index, segment_index = source_phase_increment_details(built)
         push!(phase_history, increment)
         increment <= SOURCE_PHASE_INCREMENT_LIMIT *
                      (1 + SOURCE_PHASE_INCREMENT_RELATIVE_TOLERANCE) &&
             return active, cache, built
+
+        if locally_refine_plunge_inner_grid!(
+            active, cache, built, table_index, segment_index, increment,
+        )
+            candidate_cache = nothing
+            continue
+        end
 
         required_steps = ceil(Int, active.nsteps_per_branch *
                               increment / SOURCE_PHASE_INCREMENT_LIMIT)
