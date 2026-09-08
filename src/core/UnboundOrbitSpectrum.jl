@@ -68,11 +68,11 @@ Base.@kwdef mutable struct UnboundSpectrumConfig
     mixing_tolerance::Float64 = 2e-4
 
     r_outer_floor::Float64 = 400.0
-    r_outer_cap::Float64 = 2.0e6
+    r_outer_cap::Float64 = Inf
     orbit_reference_r_outer::Float64 = NaN
     impact_outer_factor::Float64 = 2.5
-    asymptotic_match_phase::Float64 = 200.0
-    nsteps_per_branch::Int = 32000
+    asymptotic_match_phase::Float64 = FR.DEFAULT_ASYMPTOTIC_MATCH_PHASE
+    nsteps_per_branch::Int = FR.DEFAULT_SOURCE_STEPS_PER_BRANCH
     scale_nsteps_with_outer_radius::Bool = false
     radial_resolution_reference_phase::Float64 = 0.0
     asymptotic_tail_correction::Bool = true
@@ -99,7 +99,7 @@ Base.@kwdef mutable struct UnboundSpectrumConfig
 end
 
 function validate_config(cfg::UnboundSpectrumConfig)
-    cfg.energy > 1 || error("energy must be greater than one")
+    cfg.energy >= 1 || error("energy must be at least one")
     cfg.orbit_kind in ("scattering", "plunge") ||
         error("orbit_kind must be scattering or plunge")
     if !isnan(cfg.plunge_anchor_radius)
@@ -218,6 +218,7 @@ end
 
 function asymptotic_impact_scale(cfg::UnboundSpectrumConfig)
     momentum = sqrt(cfg.energy^2 - 1)
+    momentum > 0 || return cfg.r_outer_floor
     return sqrt(cfg.lz^2 + max(cfg.carter_q, 0.0)) / momentum
 end
 
@@ -248,9 +249,18 @@ end
 
 function automatic_frequency_window(cfg::UnboundSpectrumConfig, cache)
     scale = characteristic_frequency(cfg, cache)
+    tail_limited_low = if cfg.orbit_kind == "scattering" &&
+                          cfg.asymptotic_tail_correction
+        tail_cfg = base_waveform_config(
+            cfg; omega=1.0, r_outer=cfg.r_outer_cap,
+        )
+        FR.scattering_green_tail_minimum_frequency(tail_cfg, cfg.r_outer_cap)
+    else
+        cfg.asymptotic_match_phase / cfg.r_outer_cap
+    end
     automatic_low = max(
         cfg.low_frequency_ratio * scale,
-        cfg.asymptotic_match_phase / cfg.r_outer_cap,
+        tail_limited_low,
     )
     omega_min = isfinite(cfg.omega_min) ? cfg.omega_min : automatic_low
     high_ratio = cfg.orbit_kind == "scattering" ?
@@ -478,10 +488,9 @@ ModeComputationCache(orbit) = ModeComputationCache(
 )
 
 function frequency_outer_radius(cfg::UnboundSpectrumConfig,
-                                 maximum_outer::Float64,
-                                 omega::Float64)
+                                omega::Float64)
     waveform_cfg = base_waveform_config(
-        cfg; omega=omega, r_outer=maximum_outer,
+        cfg; omega=omega, r_outer=cfg.r_outer_floor,
     )
     return FR.effective_source_r_outer(waveform_cfg)
 end
@@ -503,9 +512,7 @@ function frequency_orbit!(cache::ModeComputationCache,
                           cfg::UnboundSpectrumConfig,
                           omega::Float64)
     cfg.orbit_kind == "plunge" && return cache.orbit
-    target_outer = frequency_outer_radius(
-        cfg, Float64(cache.orbit.r_outer), omega,
-    )
+    target_outer = frequency_outer_radius(cfg, omega)
     target_outer >= cache.orbit.r_outer * (1 - 1e-12) && return cache.orbit
     return get!(cache.frequency_orbits, target_outer) do
         build_frequency_orbit(cache, cfg, omega, target_outer)
@@ -533,13 +540,14 @@ function spheroidal_mode!(cache::ModeComputationCache,
     key = (ell, m, omega)
     return get!(cache.values, key) do
         orbit = frequency_orbit!(cache, cfg, omega)
+        source_outer = frequency_outer_radius(cfg, omega)
         waveform_cfg = base_waveform_config(
             cfg;
             ell=ell,
             m=m,
             omega=omega,
-            r_outer=orbit.r_outer,
-            nsteps=frequency_radial_steps(cfg, orbit.r_outer, omega),
+            r_outer=source_outer,
+            nsteps=frequency_radial_steps(cfg, source_outer, omega),
         )
         result = FR.compute_fast_reduced_waveform(
             waveform_cfg; orbit_cache=orbit,
@@ -783,9 +791,7 @@ function prewarm_frequency_orbits!(cache::ModeComputationCache,
     cfg.orbit_kind == "plunge" && return cache
     representative_omega = Dict{Float64, Float64}()
     for omega in frequencies, signed_omega in (Float64(omega), -Float64(omega))
-        target = frequency_outer_radius(
-            cfg, Float64(cache.orbit.r_outer), signed_omega,
-        )
+        target = frequency_outer_radius(cfg, signed_omega)
         target >= cache.orbit.r_outer * (1 - 1e-12) && continue
         get!(representative_omega, target, signed_omega)
     end
@@ -965,16 +971,21 @@ function requested_fixed_modes(cfg::UnboundSpectrumConfig)
 end
 
 function choose_production_outer(cfg, window)
-    phase_rate = if cfg.orbit_kind == "scattering"
-        momentum = sqrt(cfg.energy^2 - 1)
-        window.omega_min / (momentum * (cfg.energy + momentum))
+    phase_outer = if cfg.orbit_kind == "scattering" &&
+                     cfg.asymptotic_tail_correction
+        tail_cfg = base_waveform_config(
+            cfg; omega=window.omega_min, r_outer=cfg.r_outer_cap,
+        )
+        FR.scattering_green_tail_required_outer(tail_cfg)
     else
-        window.omega_min
+        cfg.asymptotic_match_phase / window.omega_min
     end
-    phase_outer = cfg.asymptotic_match_phase / phase_rate
     orbit_outer = probe_outer_radius(cfg)
-    phase_limited = min(phase_outer, cfg.r_outer_cap)
-    return max(orbit_outer, phase_limited), phase_outer > cfg.r_outer_cap
+    phase_outer <= cfg.r_outer_cap * (1 + 1e-12) || error(
+        "r_outer_cap=$(cfg.r_outer_cap) is too small for the requested " *
+        "asymptotic tail at omega_min=$(window.omega_min); require at least $phase_outer",
+    )
+    return max(orbit_outer, phase_outer), false
 end
 
 function run_unbound_spectrum(cfg::UnboundSpectrumConfig; write_output::Bool=true)

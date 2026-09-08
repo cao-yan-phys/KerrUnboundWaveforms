@@ -13,7 +13,7 @@ using PrecompileTools: @compile_workload
         phi_infinity=0.0,
         theta_sign=1.0,
         orbit_kind="scattering",
-        r_outer_min=400.0,
+        r_outer_min=1000.0,
         r_outer_floor=400.0,
         nsteps_per_branch=2000,
         asymptotic_tail_correction=true,

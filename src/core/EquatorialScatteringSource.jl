@@ -133,136 +133,29 @@ function source_phase(kerr::KerrParams, point, cfg::EquatorialScatteringConfig,
     )
 end
 
-function is_equatorial_chandrasekhar_radial_limit(cfg::EquatorialScatteringConfig)
-    Symbol(cfg.orbit_kind) === :plunge || return false
-    abs(cfg.carter_q) <= 1e-12 || return false
-    abs(cfg.theta_infinity - pi / 2) <= 1e-12 || return false
-    return abs(cfg.lz - cfg.a * cfg.energy) <=
-           1e-10 * max(1.0, abs(cfg.a * cfg.energy))
-end
-
-function equatorial_radial_shat(kerr::KerrParams, mode::AngularMode)
-    theta = pi / 2
-    r1 = 5.0
-    r2 = 7.0
-    l1 = l1p_l2p_s(kerr, r1, theta, mode)
-    l2 = l1p_l2p_s(kerr, r2, theta, mode)
-    return ComplexF64((l2 - l1) / (2 * (r2 - r1)))
-end
-
-function equatorial_radial_q(kerr::KerrParams, energy, r)
-    return sqrt(max(energy^2 - delta(kerr, r) / r^2, 0.0))
-end
-
-function equatorial_radial_phase_rhs(kerr::KerrParams,
-                                     cfg::EquatorialScatteringConfig,
-                                     rs)
-    r = KerrGeometry.r_from_rstar(kerr.a, rs)
-    q = equatorial_radial_q(kerr, cfg.energy, r)
-    return cfg.energy / q * (-cfg.omega + cfg.m * kerr.a / (r^2 + kerr.a^2))
-end
-
-function equatorial_radial_phase_table(kerr::KerrParams,
-                                       cfg::EquatorialScatteringConfig,
-                                       rs_min,
-                                       rs_max;
-                                       max_step::Float64=0.25)
-    n = max(2, ceil(Int, (rs_max - rs_min) / max_step) + 1)
-    rs = collect(range(rs_min, rs_max; length=n))
-    psi = zeros(Float64, n)
-    for i in 2:n
-        h = rs[i] - rs[i - 1]
-        x = rs[i - 1]
-        y = psi[i - 1]
-        k1 = equatorial_radial_phase_rhs(kerr, cfg, x)
-        k2 = equatorial_radial_phase_rhs(kerr, cfg, x + h / 2)
-        k3 = equatorial_radial_phase_rhs(kerr, cfg, x + h / 2)
-        k4 = equatorial_radial_phase_rhs(kerr, cfg, x + h)
-        psi[i] = y + h * (k1 + 2k2 + 2k3 + k4) / 6
-    end
-    return rs, psi
-end
-
-function interp_real(xs, ys, x)
-    x <= xs[1] && return ys[1]
-    x >= xs[end] && return ys[end]
-    lo = 1
-    hi = length(xs)
-    while hi - lo > 1
-        mid = (lo + hi) >>> 1
-        if xs[mid] <= x
-            lo = mid
-        else
-            hi = mid
-        end
-    end
-    t = (x - xs[lo]) / (xs[lo + 1] - xs[lo])
-    return ys[lo] + t * (ys[lo + 1] - ys[lo])
-end
-
-function build_equatorial_radial_limit_source(kerr::KerrParams,
-                                              constants::GeodesicConstants,
-                                              harmonic,
-                                              mode::AngularMode,
-                                              cfg::EquatorialScatteringConfig,
-                                              cache::ScatteringOrbitCache,
-                                              trajectories)
-    lambda = getproperty(harmonic, :lambda)
-    shat = equatorial_radial_shat(kerr, mode)
-    support = source_support(trajectories)
-    rs_min = KerrGeometry.rstar_from_r(kerr.a, support.r_minimum)
-    rs_max = KerrGeometry.rstar_from_r(kerr.a, support.r_maximum)
-    phase_rs, phase_psi = equatorial_radial_phase_table(kerr, cfg, rs_min, rs_max)
-
-    function reduced_at_r(r)
-        q = equatorial_radial_q(kerr, cfg.energy, r)
-        w = cfg.particle_mass * q * shat / cfg.omega^2
-        prefactor = delta(kerr, r) / (r^2 * (r^2 + kerr.a^2)^(3 / 2))
-        rs = KerrGeometry.rstar_from_r(kerr.a, r)
-        phase = cis(interp_real(phase_rs, phase_psi, rs))
-        return w * prefactor * phase
-    end
-
-    return (
-        kerr=kerr,
-        constants=constants,
-        harmonic=harmonic,
-        mode=mode,
-        r_turn=cache.r_turn,
-        r_minimum=support.r_minimum,
-        r_maximum=support.r_maximum,
-        pieces=cache.pieces,
-        trajectories=trajectories,
-        tables=NamedTuple[],
-        branch_summed_table=(
-            r=Float64[],
-            Wnn=ComplexF64[],
-            Wnmb=ComplexF64[],
-            Wmbmb=ComplexF64[],
-            f0=ComplexF64[],
-            f1=ComplexF64[],
-            f2=ComplexF64[],
-            g0=ComplexF64[],
-            g1=ComplexF64[],
-            g2=ComplexF64[],
-            h0=ComplexF64[],
-            h1=ComplexF64[],
-            h2=ComplexF64[],
-            chi_prime_outer=NaN,
-            asymptotic_tail_correction=false,
-        ),
-        reduced_at_r=reduced_at_r,
-        radial_limit=true,
-        lambda=real(lambda),
-    )
-end
-
 function plunge_composite_radial_nodes(kerr::KerrParams,
                                        piece::OrbitPiece,
-                                       nsteps::Int)
+                                       nsteps::Int;
+                                       energy::Float64=1.0)
     piece.radial_sign < 0 || error("plunge composite nodes require an incoming piece")
     piece.r_start > piece.r_stop || error("plunge radii must decrease")
     r_cut = min(200.0, piece.r_start)
+    if piece.r_start <= 200.0
+        rs_start = KerrGeometry.rstar_from_r(kerr.a, piece.r_start)
+        rs_stop = KerrGeometry.rstar_from_r(kerr.a, piece.r_stop)
+        required_steps = ceil(Int, (rs_start - rs_stop) / 0.1)
+        nsteps >= required_steps || error(
+            "plunge orbit needs at least $required_steps steps to keep " *
+            "Delta rstar <= 0.1 through r=$(piece.r_start); received $nsteps",
+        )
+        nodes = Float64[
+            KerrGeometry.r_from_rstar(kerr.a, rs)
+            for rs in range(rs_start, rs_stop; length=nsteps + 1)
+        ]
+        nodes[1] = piece.r_start
+        nodes[end] = piece.r_stop
+        return nodes
+    end
     r_cut > piece.r_stop ||
         return collect(range(piece.r_start, piece.r_stop; length=nsteps + 1))
 
@@ -275,7 +168,13 @@ function plunge_composite_radial_nodes(kerr::KerrParams,
         "Delta rstar <= 0.1 through r=200M; received $nsteps",
     )
 
-    outer = exp.(range(log(piece.r_start), log(r_cut); length=outer_steps + 1))
+    outer = if energy == 1.0
+        q_start = piece.r_start^(3 / 2)
+        q_cut = r_cut^(3 / 2)
+        collect(range(q_start, q_cut; length=outer_steps + 1)).^(2 / 3)
+    else
+        collect(range(piece.r_start, r_cut; length=outer_steps + 1))
+    end
     inner_rstar = range(rs_cut, rs_stop; length=inner_steps + 1)
     inner = Float64[KerrGeometry.r_from_rstar(kerr.a, rs) for rs in inner_rstar]
     outer[1] = piece.r_start
@@ -315,7 +214,9 @@ function build_scattering_orbit_cache(cfg::EquatorialScatteringConfig)
         theta_sign=outer_state.theta_sign,
     )
     radial_nodes = kind === :plunge ?
-        [plunge_composite_radial_nodes(kerr, piece, cfg.nsteps_per_branch)
+        [plunge_composite_radial_nodes(
+             kerr, piece, cfg.nsteps_per_branch; energy=cfg.energy,
+         )
          for piece in pieces] : nothing
     trajectories = integrate_orbit_pieces(
         kerr,
@@ -490,33 +391,44 @@ function plunge_tail_extension_radii(cfg::EquatorialScatteringConfig,
     rate0 = abs(point_chi_prime_cached(
         KerrParams(a=cfg.a), outer_point, cfg.omega, cfg.m,
     ))
-    radius0 * rate0 >= cfg.asymptotic_match_phase && return Float64[]
+    abs(cfg.omega) > 0 || error("a plunge asymptotic tail requires nonzero frequency")
     momentum = sqrt(cfg.energy^2 - 1)
-    momentum > 0 || return Float64[]
-    slow_rate_infinity = abs(cfg.omega) /
-                         (momentum * (cfg.energy + momentum))
-    slow_rate_infinity > 0 || error("degenerate incoming asymptotic phase")
+    parabolic = momentum == 0
+    slow_rate_infinity = parabolic ? NaN :
+                          abs(cfg.omega) /
+                          (momentum * (cfg.energy + momentum))
+    !parabolic && slow_rate_infinity > 0 || parabolic ||
+        error("degenerate incoming asymptotic phase")
+    worldline_stop = parabolic ?
+        (3cfg.asymptotic_match_phase / (sqrt(2.0) * abs(cfg.omega)))^(2 / 3) :
+        cfg.asymptotic_match_phase / slow_rate_infinity
+    radial_stop = 100.0 / abs(cfg.omega)
     radius_stop = max(
         radius0,
-        cfg.asymptotic_match_phase / slow_rate_infinity,
+        worldline_stop,
+        radial_stop,
     )
+    radius0 * rate0 >= cfg.asymptotic_match_phase &&
+        radius0 >= radial_stop && return Float64[]
     radius_stop > radius0 * (1 + 1e-12) || return Float64[]
 
-    phase_step = 0.025
+    phase_step = 0.05
     relative_step = 0.01
     step = max(inner_radial_step, eps(Float64) * radius0)
     radii = Float64[radius0]
     while radii[end] < radius_stop
+        local_phase_rate = parabolic ? abs(cfg.omega) * sqrt(2.0 * radii[end]) :
+                           slow_rate_infinity
         step = min(
             1.2 * step,
             relative_step * radii[end],
-            phase_step / slow_rate_infinity,
+            phase_step / local_phase_rate,
             radius_stop - radii[end],
         )
         step > 0 || error("plunge asymptotic extension grid stalled")
         push!(radii, radii[end] + step)
-        length(radii) <= 20001 ||
-            error("plunge asymptotic extension exceeded 20000 steps")
+        length(radii) <= 1_000_001 ||
+            error("plunge asymptotic extension exceeded 1000000 phase-resolved steps")
     end
     radii[end] = radius_stop
     return radii
@@ -895,14 +807,26 @@ function fitted_oscillatory_tail(r, integrand, phase_values, chi_prime_values;
     return phase_values[end] * tail_amplitude
 end
 
+function parabolic_fitted_oscillatory_tail(r, integrand, phase_values,
+                                            chi_prime_values;
+                                            order::Int=3, max_points::Int=64)
+    y = sqrt.(r)
+    jacobian = 2 .* y
+    return fitted_oscillatory_tail(
+        y, integrand .* jacobian, phase_values, chi_prime_values .* jacobian;
+        order=order, max_points=max_points,
+    )
+end
+
 function mathcalW_channel_from_values!(W, scratch1, scratch2, scratch3,
                                        r, v0, v1, v2, chi_prime_input;
                                        asymptotic_tail_correction::Bool=true,
                                        integration_x=nothing,
                                        dr_dx=nothing,
-                                       phase_values=nothing,
-                                       phase_arguments=nothing,
-                                       tail_order::Int=3)
+                                        phase_values=nothing,
+                                        phase_arguments=nothing,
+                                        tail_order::Int=3,
+                                        parabolic_tail::Bool=false)
     x = integration_x === nothing ? r : integration_x
     jac = dr_dx
     if phase_values === nothing
@@ -945,19 +869,28 @@ function mathcalW_channel_from_values!(W, scratch1, scratch2, scratch3,
         outer_moment_2 = oscillatory_first_moment_tail(v2[end], chi_prime_outer)
     else
         max_points = asymptotic_fit_point_count(r)
+        tail_function = parabolic_tail ?
+            parabolic_fitted_oscillatory_tail : fitted_oscillatory_tail
         outer_tail_1 = v1 === nothing ? 0.0 + 0.0im :
-            fitted_oscillatory_tail(
+            tail_function(
                 r, v1, phase_values, chi_prime_input;
                 order=tail_order, max_points=max_points,
             )
-        outer_tail_2 = fitted_oscillatory_tail(
+        outer_tail_2 = tail_function(
             r, v2, phase_values, chi_prime_input;
             order=tail_order, max_points=max_points,
         )
-        outer_moment_2 = fitted_oscillatory_tail(
-            r, v2, phase_values, chi_prime_input;
-            order=tail_order, max_points=max_points, radial_power=1,
-        ) - r[end] * outer_tail_2
+        outer_moment_2 = if parabolic_tail
+            tail_function(
+                r, r .* v2, phase_values, chi_prime_input;
+                order=tail_order, max_points=max_points,
+            ) - r[end] * outer_tail_2
+        else
+            fitted_oscillatory_tail(
+                r, v2, phase_values, chi_prime_input;
+                order=tail_order, max_points=max_points, radial_power=1,
+            ) - r[end] * outer_tail_2
+        end
     end
     r_outer = r[end]
     @inbounds @simd for i in eachindex(W)
@@ -987,7 +920,8 @@ function mathcalW_channel_from_values(r, v0, v1, v2, chi_prime_input;
                                       dr_dx=nothing,
                                       phase_values=nothing,
                                       phase_arguments=nothing,
-                                      tail_order::Int=3)
+                                      tail_order::Int=3,
+                                      parabolic_tail::Bool=false)
     W = Vector{ComplexF64}(undef, length(r))
     scratch1 = similar(W)
     scratch2 = similar(W)
@@ -1001,6 +935,7 @@ function mathcalW_channel_from_values(r, v0, v1, v2, chi_prime_input;
         phase_values=phase_values,
         phase_arguments=phase_arguments,
         tail_order=tail_order,
+        parabolic_tail=parabolic_tail,
     )
     return (W=W, inner_m0=moments.inner_m0, inner_m1=moments.inner_m1)
 end
@@ -1174,6 +1109,7 @@ function build_piece_table_from_integrands(kerr::KerrParams, constants::Geodesic
         phase_values=phase_values,
         phase_arguments=phase_arguments,
         tail_order=cfg.asymptotic_tail_order,
+        parabolic_tail=cfg.energy == 1.0,
     )
     nm_solution = mathcalW_channel_from_values!(
         Wnmb, scratch1, scratch2, scratch3,
@@ -1184,6 +1120,7 @@ function build_piece_table_from_integrands(kerr::KerrParams, constants::Geodesic
         phase_values=phase_values,
         phase_arguments=phase_arguments,
         tail_order=cfg.asymptotic_tail_order,
+        parabolic_tail=cfg.energy == 1.0,
     )
     mm_solution = mathcalW_channel_from_values!(
         Wmbmb, scratch1, scratch2, scratch3,
@@ -1194,6 +1131,7 @@ function build_piece_table_from_integrands(kerr::KerrParams, constants::Geodesic
         phase_values=phase_values,
         phase_arguments=phase_arguments,
         tail_order=cfg.asymptotic_tail_order,
+        parabolic_tail=cfg.energy == 1.0,
     )
 
     all(finite_complex, Wnn) || error("non-finite Wnn table for $(traj.piece.label)")
@@ -1422,8 +1360,7 @@ function build_scattering_source_from_cache(cfg::EquatorialScatteringConfig,
     pieces = cache.pieces
     trajectories = clipped_trajectories(cache, cfg)
     if cache.orbit_kind === :plunge &&
-       effective_asymptotic_tail_correction(cfg) &&
-       !is_equatorial_chandrasekhar_radial_limit(cfg)
+       effective_asymptotic_tail_correction(cfg)
         trajectories = PieceTrajectory[
             extend_plunge_trajectory_for_abel_tail(
                 cfg, kerr, constants, trajectory,
@@ -1433,17 +1370,6 @@ function build_scattering_source_from_cache(cfg::EquatorialScatteringConfig,
     end
     t_origin, phi_origin = trajectory_phase_origin(trajectories, cfg)
     harmonic, mode = scattering_mode(kerr, cfg)
-    if is_equatorial_chandrasekhar_radial_limit(cfg)
-        return build_equatorial_radial_limit_source(
-            kerr,
-            constants,
-            harmonic,
-            mode,
-            cfg,
-            cache,
-            trajectories,
-        )
-    end
     built = assemble_direct_source(
         cfg,
         kerr,

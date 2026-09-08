@@ -6,14 +6,23 @@ include(joinpath(@__DIR__, "SNGreenAmplitude.jl"))
 using .EquatorialScatteringSource
 using .SNGreenAmplitude
 import ...KerrGeometry
-import ...NativeSN
 
 const UG = EquatorialScatteringSource.UG
+
+const SN_INFINITY_MINIMUM_PHASE = 100.0
+const DEFAULT_ASYMPTOTIC_MATCH_PHASE = 200.0
+const DEFAULT_SOURCE_STEPS_PER_BRANCH = 32_000
+const SOURCE_PHASE_INCREMENT_LIMIT = 0.05
+const SOURCE_PHASE_INCREMENT_RELATIVE_TOLERANCE = 1.0e-7
+const MAX_AUTOMATIC_SOURCE_REFINEMENTS = 8
+const MAX_AUTOMATIC_SOURCE_STEPS = 1_000_000
 
 export FastReducedWaveformConfig,
        FastReducedWaveformResult,
        effective_source_grid,
        effective_source_r_outer,
+       scattering_green_tail_required_outer,
+       scattering_green_tail_minimum_frequency,
        build_fast_reduced_orbit_cache,
        compute_fast_reduced_waveform,
        fast_reduced_waveform_row,
@@ -33,9 +42,9 @@ Base.@kwdef mutable struct FastReducedWaveformConfig
     orbit_kind::String = "scattering"
     r_outer_min::Float64 = 80.0
     r_outer_floor::Float64 = 0.0
-    nsteps_per_branch::Int = 32000
+    nsteps_per_branch::Int = DEFAULT_SOURCE_STEPS_PER_BRANCH
     asymptotic_tail_correction::Bool = true
-    asymptotic_match_phase::Float64 = 200.0
+    asymptotic_match_phase::Float64 = DEFAULT_ASYMPTOTIC_MATCH_PHASE
     source_tail_order::Int = 3
     green_tail_correction::Bool = true
     scattering_green_tail_slow_order::Int = 3
@@ -48,6 +57,7 @@ Base.@kwdef mutable struct FastReducedWaveformConfig
     homogeneous_method::String = "linear"
     homogeneous_tolerance::Float64 = 1e-12
     integration_rule::String = "trapezoid"
+    radial_backend::AbstractRadialBackend = NATIVE_SN_BACKEND
 end
 
 struct FastReducedWaveformResult
@@ -68,43 +78,70 @@ effective_asymptotic_tail_correction(cfg::FastReducedWaveformConfig) =
 
 function scattering_green_tail_phase_rate(cfg::FastReducedWaveformConfig)
     momentum = sqrt(cfg.energy^2 - 1)
-    momentum > 0 || error("a scattering Green tail requires energy greater than one")
+    momentum > 0 || error("the finite-velocity scattering phase rate is undefined at E=1")
     abs(cfg.omega) > 0 || error("a scattering Green tail requires nonzero frequency")
     return abs(cfg.omega) / (momentum * (cfg.energy + momentum))
 end
 
+function scattering_green_tail_required_outer(cfg::FastReducedWaveformConfig)
+    cfg.orbit_kind == "scattering" ||
+        error("a scattering Green-tail outer radius was requested for a non-scattering orbit")
+    abs(cfg.omega) > 0 || error("a scattering Green tail requires nonzero frequency")
+    cfg.asymptotic_match_phase > 0 ||
+        error("asymptotic_match_phase must be positive")
+    worldline_outer = if cfg.energy == 1.0
+        (3cfg.asymptotic_match_phase / (sqrt(2.0) * abs(cfg.omega)))^(2 / 3)
+    else
+        cfg.asymptotic_match_phase / scattering_green_tail_phase_rate(cfg)
+    end
+    radial_outer = SN_INFINITY_MINIMUM_PHASE / abs(cfg.omega)
+    return max(
+        cfg.r_outer_floor,
+        worldline_outer,
+        radial_outer,
+    )
+end
+
+function scattering_green_tail_minimum_frequency(cfg::FastReducedWaveformConfig,
+                                                  r_outer::Real)
+    cfg.orbit_kind == "scattering" ||
+        error("a scattering Green-tail frequency bound was requested for a non-scattering orbit")
+    r_outer > 0 || error("outer radius must be positive")
+    worldline_minimum = if cfg.energy == 1.0
+        3cfg.asymptotic_match_phase /
+        (sqrt(2.0) * Float64(r_outer)^(3 / 2))
+    else
+        momentum = sqrt(cfg.energy^2 - 1)
+        cfg.asymptotic_match_phase * momentum * (cfg.energy + momentum) /
+        Float64(r_outer)
+    end
+    radial_minimum = SN_INFINITY_MINIMUM_PHASE / Float64(r_outer)
+    return max(worldline_minimum, radial_minimum)
+end
+
 function effective_source_r_outer(cfg::FastReducedWaveformConfig)
     cfg.r_outer_floor >= 0 || error("r_outer_floor must be nonnegative")
-    cfg.r_outer_min >= cfg.r_outer_floor ||
-        error("r_outer_min must be at least r_outer_floor")
+    cfg.r_outer_min > 0 || error("r_outer_min must be positive")
     if cfg.orbit_kind == "scattering" &&
        effective_asymptotic_tail_correction(cfg)
-        cfg.asymptotic_match_phase > 0 ||
-            error("asymptotic_match_phase must be positive")
-        required_outer = max(
-            cfg.r_outer_floor,
-            cfg.asymptotic_match_phase /
-            scattering_green_tail_phase_rate(cfg),
-        )
-        cfg.r_outer_min >= required_outer * (1 - 1e-12) || error(
-            "r_outer_min=$(cfg.r_outer_min) is too small for the scattering " *
-            "Green tail; require at least $required_outer",
-        )
-        return required_outer
+        required_outer = scattering_green_tail_required_outer(cfg)
+        return max(cfg.r_outer_min, required_outer)
     elseif cfg.orbit_kind == "plunge" &&
            effective_asymptotic_tail_correction(cfg)
         cfg.asymptotic_match_phase > 0 ||
             error("asymptotic_match_phase must be positive")
-        return max(cfg.r_outer_floor, min(
+        abs(cfg.omega) > 0 || error("a plunge asymptotic tail requires nonzero frequency")
+        return max(
             cfg.r_outer_min,
-            cfg.asymptotic_match_phase / abs(cfg.omega),
-        ))
+            cfg.r_outer_floor,
+            SN_INFINITY_MINIMUM_PHASE / abs(cfg.omega),
+        )
     end
     return cfg.r_outer_min
 end
 
 function source_config(cfg::FastReducedWaveformConfig; orbit_cache::Bool=false)
-    r_outer = orbit_cache ? cfg.r_outer_min : effective_source_r_outer(cfg)
+    r_outer = effective_source_r_outer(cfg)
     return EquatorialScatteringConfig(
         a=cfg.a,
         ell=cfg.ell,
@@ -132,8 +169,51 @@ function build_fast_reduced_orbit_cache(cfg::FastReducedWaveformConfig)
     return build_scattering_orbit_cache(source_config(cfg; orbit_cache=true))
 end
 
-function table_grid_source(cfg::FastReducedWaveformConfig, built)
-    table = built.branch_summed_table
+function source_phase_increment(built)
+    increments = Float64[]
+    for table in built.tables
+        length(table.phase_arguments) >= 2 || continue
+        push!(increments, maximum(abs.(diff(table.phase_arguments))))
+    end
+    isempty(increments) && error("source table has no phase increments")
+    return maximum(increments)
+end
+
+function resolved_fast_reduced_source(cfg::FastReducedWaveformConfig;
+                                      orbit_cache=nothing)
+    active = deepcopy(cfg)
+    candidate_cache = orbit_cache
+    phase_history = Float64[]
+    for _ in 1:MAX_AUTOMATIC_SOURCE_REFINEMENTS
+        scfg = source_config(active)
+        cache = candidate_cache === nothing ?
+                build_scattering_orbit_cache(source_config(active; orbit_cache=true)) :
+                candidate_cache
+        built = build_scattering_source_from_cache(scfg, cache)
+        increment = source_phase_increment(built)
+        push!(phase_history, increment)
+        increment <= SOURCE_PHASE_INCREMENT_LIMIT *
+                     (1 + SOURCE_PHASE_INCREMENT_RELATIVE_TOLERANCE) &&
+            return active, cache, built
+
+        required_steps = ceil(Int, active.nsteps_per_branch *
+                              increment / SOURCE_PHASE_INCREMENT_LIMIT)
+        required_steps = max(required_steps, active.nsteps_per_branch + 1)
+        required_steps <= MAX_AUTOMATIC_SOURCE_STEPS || error(
+            "automatic source-phase resolution requires $required_steps steps per " *
+            "branch, above the safe limit $MAX_AUTOMATIC_SOURCE_STEPS",
+        )
+        active.nsteps_per_branch = required_steps
+        candidate_cache = nothing
+    end
+    error(
+        "automatic source-phase resolution did not converge for " *
+        "(ell,m,omega)=($(cfg.ell),$(cfg.m),$(cfg.omega)); " *
+        "phase increments=$(phase_history)",
+    )
+end
+
+function table_rstar_and_source(cfg::FastReducedWaveformConfig, built, table)
     outer_r = table.r
     issorted(outer_r) || error("branch-summed source table is not radius ordered")
     outer_rstar = Vector{Float64}(undef, length(outer_r))
@@ -148,6 +228,12 @@ function table_grid_source(cfg::FastReducedWaveformConfig, built)
         ))
         outer_source[i] = built.particle_mass * total * prefactor * outgoing_phase
     end
+    return outer_rstar, outer_source
+end
+
+function table_grid_source(cfg::FastReducedWaveformConfig, built)
+    table = built.branch_summed_table
+    outer_rstar, outer_source = table_rstar_and_source(cfg, built, table)
     if cfg.orbit_kind == "scattering"
         rs_min = KerrGeometry.rstar_from_r(cfg.a, built.r_minimum)
         rs_turn = KerrGeometry.rstar_from_r(cfg.a, built.r_turn)
@@ -182,30 +268,42 @@ function uniform_rstar_source(cfg::FastReducedWaveformConfig, built)
 end
 
 function plunge_composite_rstar_source(cfg::FastReducedWaveformConfig, built)
-    cfg.npoints >= 5 || error("plunge composite grid needs at least five points")
+    length(built.tables) == 1 ||
+        error("a plunge source requires exactly one source table")
+    table = only(built.tables)
+    outer_rstar, outer_source = table_rstar_and_source(cfg, built, table)
     rs_min = KerrGeometry.rstar_from_r(cfg.a, built.r_minimum)
-    rs_max = KerrGeometry.rstar_from_r(cfg.a, built.r_maximum)
-    r_cut = min(200.0, built.r_maximum)
+    physical_outer = built.r_maximum
+    source_end = searchsortedlast(
+        table.r,
+        physical_outer + 1e-10 * max(1.0, physical_outer),
+    )
+    source_end >= 2 ||
+        error("plunge source table does not reach the physical outer boundary")
+    rs_max = KerrGeometry.rstar_from_r(cfg.a, physical_outer)
+    r_cut = min(200.0, physical_outer)
     rs_cut = KerrGeometry.rstar_from_r(cfg.a, r_cut)
     if rs_cut <= rs_min || rs_cut >= rs_max
-        return uniform_rstar_source(cfg, built)
+        return @view(outer_rstar[1:source_end]),
+               @view(outer_source[1:source_end])
     end
 
     inner_count = max(3, ceil(Int, (rs_cut - rs_min) / 0.1) + 1)
-    required_points = inner_count + 2
-    cfg.npoints >= required_points || error(
-        "plunge composite grid needs at least $required_points points to keep " *
-        "Delta rstar <= 0.1 through r=200M; received $(cfg.npoints)",
-    )
-    outer_count = cfg.npoints - inner_count + 1
     inner = collect(range(rs_min, rs_cut; length=inner_count))
-    outer = collect(range(rs_cut, rs_max; length=outer_count))
-    rstar = vcat(inner, @view(outer[2:end]))
-    source = ComplexF64[
+    inner_source = ComplexF64[
         built.reduced_at_r(KerrGeometry.r_from_rstar(cfg.a, rs))
-        for rs in rstar
+        for rs in inner
     ]
-    return rstar, source
+    outer_start = searchsortedfirst(table.r, r_cut)
+    outer_start <= source_end ||
+        error("plunge source table does not reach the composite outer region")
+    if isapprox(outer_rstar[outer_start], rs_cut; rtol=1e-12, atol=1e-12)
+        outer_start += 1
+    end
+    outer_start <= source_end ||
+        error("plunge source table has no points beyond the composite join")
+    return vcat(inner, @view(outer_rstar[outer_start:source_end])),
+           vcat(inner_source, @view(outer_source[outer_start:source_end]))
 end
 
 function source_grid_values(cfg::FastReducedWaveformConfig, built)
@@ -231,6 +329,7 @@ function green_config(cfg::FastReducedWaveformConfig, rstar, lambda::Real=NaN)
         homogeneous_method=cfg.homogeneous_method,
         homogeneous_tolerance=cfg.homogeneous_tolerance,
         integration_rule=cfg.integration_rule,
+        radial_backend=cfg.radial_backend,
     )
 end
 
@@ -252,16 +351,18 @@ function plunge_green_tail_integral(kernel::GreenKernel, built,
         error("a plunge Green tail requires exactly one source table")
     table = only(built.tables)
     physical_outer = built.r_maximum
-    table.r[end] > physical_outer * (1 + 1e-12) ||
-        return 0.0 + 0.0im
-    numeric_start_global = searchsortedfirst(table.r, physical_outer)
-    numeric_start_global <= length(table.r) ||
+    table.r[end] + 1e-12 * max(1.0, physical_outer) >= physical_outer ||
         error("plunge source table does not reach the physical outer radius")
+    insertion = searchsortedfirst(table.r, physical_outer)
+    candidates = filter(i -> 1 <= i <= length(table.r), (insertion - 1):insertion)
+    isempty(candidates) &&
+        error("plunge source table does not reach the physical outer radius")
+    numeric_start_global = argmin(i -> abs(table.r[i] - physical_outer), candidates)
     abs(table.r[numeric_start_global] - physical_outer) <=
         1e-8 * max(1.0, physical_outer) ||
         error("plunge source table misses the physical outer boundary")
 
-    fit_count = min(length(table.r), 96)
+    fit_count = EquatorialScatteringSource.asymptotic_fit_point_count(table.r)
     fit_start_global = length(table.r) - fit_count + 1
     work_start = min(numeric_start_global, fit_start_global)
     r = @view table.r[work_start:end]
@@ -298,7 +399,10 @@ function plunge_green_tail_integral(kernel::GreenKernel, built,
     fit_fast_rate = @view fast_rate[fit_start:end]
     slow_values = @view(slow_amplitude[fit_start:end]) .* cis.(fit_phase)
     fast_values = @view(fast_amplitude[fit_start:end]) .* cis.(fit_fast_phase)
-    tail += EquatorialScatteringSource.fitted_oscillatory_tail(
+    tail_function = cfg.energy == 1.0 ?
+                    EquatorialScatteringSource.parabolic_fitted_oscillatory_tail :
+                    EquatorialScatteringSource.fitted_oscillatory_tail
+    tail += tail_function(
         fit_r,
         slow_values,
         cis.(fit_phase),
@@ -306,7 +410,7 @@ function plunge_green_tail_integral(kernel::GreenKernel, built,
         order=3,
         max_points=fit_count,
     )
-    tail += EquatorialScatteringSource.fitted_oscillatory_tail(
+    tail += tail_function(
         fit_r,
         fast_values,
         cis.(fit_fast_phase),
@@ -317,22 +421,33 @@ function plunge_green_tail_integral(kernel::GreenKernel, built,
     return ComplexF64(tail)
 end
 
+function scattering_fitted_green_tail(cfg::FastReducedWaveformConfig,
+                                      r, integrand, phase, phase_rate;
+                                      order::Int, max_points::Int)
+    if cfg.energy == 1.0
+        return EquatorialScatteringSource.parabolic_fitted_oscillatory_tail(
+            r, integrand, phase, phase_rate;
+            order=order, max_points=max_points,
+        )
+    end
+    return EquatorialScatteringSource.fitted_oscillatory_tail(
+        r, integrand, phase, phase_rate;
+        order=order, max_points=max_points,
+    )
+end
+
 function scattering_green_tail_integral(kernel::GreenKernel, built,
                                         cfg::FastReducedWaveformConfig)
     length(built.tables) == 2 ||
         error("a scattering Green tail requires incoming and outgoing source tables")
     coefficient_order = kernel.cfg.infinity_expansion_order
-    mode = NativeSN.SNMode(
-        kernel.cfg.a,
-        kernel.cfg.m,
-        kernel.cfg.omega,
-        real(kernel.lambda),
+    outgoing_coefficients = SNGreenAmplitude.infinity_coefficients(
+        kernel.cfg.radial_backend, kernel.cfg, kernel.lambda,
+        :outgoing, coefficient_order,
     )
-    outgoing_coefficients = NativeSN.infinity_coefficients(
-        mode, :outgoing; order=coefficient_order,
-    )
-    incoming_coefficients = NativeSN.infinity_coefficients(
-        mode, :ingoing; order=coefficient_order,
+    incoming_coefficients = SNGreenAmplitude.infinity_coefficients(
+        kernel.cfg.radial_backend, kernel.cfg, kernel.lambda,
+        :ingoing, coefficient_order,
     )
     asymptotic_factor(coefficients, radius) = sum(
         coefficients[order + 1] / (cfg.omega * radius)^order
@@ -387,7 +502,8 @@ function scattering_green_tail_integral(kernel::GreenKernel, built,
                              radial_prefactor .* smooth_W .* outgoing_factor
         incoming_amplitude = built.particle_mass * kernel.binc .*
                              radial_prefactor .* smooth_W .* incoming_factor
-        tail += EquatorialScatteringSource.fitted_oscillatory_tail(
+        tail += scattering_fitted_green_tail(
+            cfg,
             r,
             outgoing_amplitude .* cis.(outgoing_phase),
             cis.(outgoing_phase),
@@ -395,7 +511,8 @@ function scattering_green_tail_integral(kernel::GreenKernel, built,
             order=cfg.scattering_green_tail_slow_order,
             max_points=fit_count,
         )
-        tail += EquatorialScatteringSource.fitted_oscillatory_tail(
+        tail += scattering_fitted_green_tail(
+            cfg,
             r,
             incoming_amplitude .* cis.(incoming_phase),
             cis.(incoming_phase),
@@ -410,9 +527,8 @@ end
 function compute_fast_reduced_waveform(cfg::FastReducedWaveformConfig;
                                        orbit_cache=nothing)
     t0 = time()
+    cfg, cache, built = resolved_fast_reduced_source(cfg; orbit_cache=orbit_cache)
     scfg = source_config(cfg)
-    cache = orbit_cache === nothing ? build_scattering_orbit_cache(scfg) : orbit_cache
-    built = build_scattering_source_from_cache(scfg, cache)
     rstar, source = source_grid_values(cfg, built)
     gcfg = green_config(cfg, rstar, real(getproperty(built.harmonic, :lambda)))
     green = if cfg.orbit_kind == "plunge" &&

@@ -7,6 +7,15 @@ using SpinWeightedSpheroidalHarmonics
 export GreenAmplitudeConfig,
        GreenKernel,
        GreenAmplitudeResult,
+       AbstractRadialBackend,
+       NativeSNBackend,
+       NATIVE_SN_BACKEND,
+       radial_eigenvalue,
+       build_in_solution,
+       match_infinity,
+       sample_in!,
+       eta_constant,
+       infinity_coefficients,
        build_green_kernel,
        apply_green_kernel,
        apply_green_kernel_partitioned,
@@ -16,6 +25,44 @@ export GreenAmplitudeConfig,
        read_reduced_source_csv,
        write_green_summary_csv,
        relative_difference
+
+abstract type AbstractRadialBackend end
+
+struct NativeSNBackend <: AbstractRadialBackend end
+
+const NATIVE_SN_BACKEND = NativeSNBackend()
+
+radial_eigenvalue(::NativeSNBackend, spin, ell, m, aomega) =
+    spin_weighted_spheroidal_harmonic(spin, ell, m, aomega; method="auto").lambda
+
+function build_in_solution(::NativeSNBackend, cfg, lambda, rsin, rsout)
+    mode = NativeSN.SNMode(cfg.a, cfg.m, cfg.omega, lambda)
+    solution = NativeSNLinear.solve_in(
+        mode;
+        rsin=rsin,
+        rsout=rsout,
+        tolerance=cfg.homogeneous_tolerance,
+        horizon_order=cfg.horizon_expansion_order,
+    )
+    return (mode=mode, solution=solution)
+end
+
+match_infinity(::NativeSNBackend, state, cfg) =
+    NativeSNLinear.match_infinity(
+        state.solution; order=cfg.infinity_expansion_order,
+    )
+
+function sample_in!(::NativeSNBackend, values, state, rstar)
+    state.solution.numerical_solution(values, rstar; idxs=1)
+    return values
+end
+
+eta_constant(::NativeSNBackend, state) = NativeSN.eta_coefficient(state.mode, 0)
+
+function infinity_coefficients(::NativeSNBackend, cfg, lambda, direction, order)
+    mode = NativeSN.SNMode(cfg.a, cfg.m, cfg.omega, real(lambda))
+    return NativeSN.infinity_coefficients(mode, direction; order=order)
+end
 
 Base.@kwdef mutable struct GreenAmplitudeConfig
     a::Float64 = 0.9
@@ -33,6 +80,7 @@ Base.@kwdef mutable struct GreenAmplitudeConfig
     homogeneous_method::String = "linear"
     homogeneous_tolerance::Float64 = 1e-12
     integration_rule::String = "trapezoid"
+    radial_backend::AbstractRadialBackend = NATIVE_SN_BACKEND
 end
 
 struct GreenAmplitudeResult
@@ -217,26 +265,16 @@ function build_green_kernel(rstar, cfg::GreenAmplitudeConfig)
     end
     rsin = min(rs[1], cfg.homogeneous_rsin)
     rsout = max(rs[end], cfg.homogeneous_rsout_min)
+    backend = cfg.radial_backend
     lambda = isfinite(cfg.lambda) ? cfg.lambda :
-        spin_weighted_spheroidal_harmonic(
-            cfg.spin, cfg.ell, cfg.m, cfg.a * cfg.omega; method="auto",
-        ).lambda
-    mode = NativeSN.SNMode(cfg.a, cfg.m, cfg.omega, lambda)
-    solution = NativeSNLinear.solve_in(
-        mode;
-        rsin=rsin,
-        rsout=rsout,
-        tolerance=cfg.homogeneous_tolerance,
-        horizon_order=cfg.horizon_expansion_order,
-    )
-    amplitudes = NativeSNLinear.match_infinity(
-        solution; order=cfg.infinity_expansion_order,
-    )
+        radial_eigenvalue(backend, cfg.spin, cfg.ell, cfg.m, cfg.a * cfg.omega)
+    state = build_in_solution(backend, cfg, lambda, rsin, rsout)
+    amplitudes = match_infinity(backend, state, cfg)
     bref = amplitudes.bref
     binc = amplitudes.binc
-    c0 = NativeSN.eta_coefficient(mode, 0)
+    c0 = eta_constant(backend, state)
     xin_values = Vector{ComplexF64}(undef, length(rs))
-    solution.numerical_solution(xin_values, rs; idxs=1)
+    sample_in!(backend, xin_values, state, rs)
     return GreenKernel(
         cfg,
         rs,

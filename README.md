@@ -33,10 +33,10 @@ save(result, "output")
 
 ## 例子
 
-类光无穷远处的能流：
+未来类光无穷远处的能流：
 
 ![](examples/generic_kerr_scattering_spectrum.png?v=20260904)
 
-外视界上的能流：
+未来事件视界上的能流：
 
 ![](examples/horizon_m2_signed_spectrum.png?v=20260904)

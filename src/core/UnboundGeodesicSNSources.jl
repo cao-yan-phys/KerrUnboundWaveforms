@@ -539,7 +539,6 @@ function asymptotic_tail_transport(kerr::KerrParams,
                                    x_stop::Float64;
                                    steps::Int=2048)
     steps >= 16 || error("asymptotic angular transport needs at least 16 steps")
-    c.energy > 1 || error("asymptotic angular transport requires an unbound orbit")
     radial_sign in (-1.0, 1.0) || error("invalid radial sign")
     theta_sign in (-1.0, 1.0) || error("invalid polar sign")
     x_start >= 0 && x_stop >= 0 || error("compact radii must be nonnegative")
@@ -550,7 +549,10 @@ function asymptotic_tail_transport(kerr::KerrParams,
         return (theta=0.0, phi=0.0, theta_sign=theta_sign)
     end
 
+    c.energy >= 1 || error("asymptotic angular transport requires energy at least one")
+
     lower, upper = theta_allowed_interval(kerr, c, theta)
+    momentum_squared = max(c.energy^2 - 1.0, 0.0)
     radial_square(x) = begin
         a = kerr.a
         A = c.energy * a^2 - a * c.lz
@@ -558,7 +560,10 @@ function asymptotic_tail_transport(kerr::KerrParams,
         (c.energy + A * x^2)^2 -
         (1 - 2x + a^2 * x^2) * (1 + B * x^2)
     end
-    rhs(theta_value, x, polar_sign) = begin
+    rhs(theta_value, parameter, polar_sign) = begin
+        x = (parameter^2 - momentum_squared) / 2
+        x >= -64eps(Float64) || error("asymptotic transport left the physical compact domain")
+        x = max(x, 0.0)
         theta_value = clamp(theta_value, lower, upper)
         theta_value == 0.0 && error("non-axial asymptotic transport reached the axis")
         sine = sin(theta_value)
@@ -568,18 +573,21 @@ function asymptotic_tail_transport(kerr::KerrParams,
         radial_value >= -1.0e-13 ||
             error("asymptotic transport encountered a forbidden radial point")
         root_radial = sqrt(max(radial_value, 0.0))
-        root_radial > 0 || error("asymptotic transport encountered a radial turning point")
+        radial_scale = abs(parameter) <= sqrt(eps(Float64)) ? sqrt(2.0) :
+                       root_radial / abs(parameter)
+        radial_scale > 0 ||
+            error("asymptotic transport encountered a radial turning point")
         theta_value_potential = theta_potential(kerr, c, theta_value)
         theta_value_potential >= -1.0e-12 ||
             error("asymptotic transport encountered a forbidden polar point")
         dtheta = -polar_sign * sqrt(max(theta_value_potential, 0.0)) /
-                 (radial_sign * root_radial)
+                 (radial_sign * radial_scale)
         A = c.energy * kerr.a^2 - kerr.a * c.lz
         denominator = 1 - 2x + kerr.a^2 * x^2
         dphi_numerator =
             -(kerr.a * c.energy - c.lz / sine^2) +
             kerr.a * (c.energy + A * x^2) / denominator
-        dphi = -dphi_numerator / (radial_sign * root_radial)
+        dphi = -dphi_numerator / (radial_sign * radial_scale)
         return dtheta, dphi
     end
     reflect(theta_value, polar_sign) = begin
@@ -597,18 +605,27 @@ function asymptotic_tail_transport(kerr::KerrParams,
         error("asymptotic transport crossed too many polar turning points in one step")
     end
 
-    h = (x_stop - x_start) / steps
-    x = x_start
+    parameter_start = sqrt(momentum_squared + 2x_start)
+    parameter_stop = sqrt(momentum_squared + 2x_stop)
     polar_sign = theta_sign
-    for _ in 1:steps
-        k1theta, k1phi = rhs(theta, x, polar_sign)
-        k2theta, k2phi = rhs(theta + h * k1theta / 2, x + h / 2, polar_sign)
-        k3theta, k3phi = rhs(theta + h * k2theta / 2, x + h / 2, polar_sign)
-        k4theta, k4phi = rhs(theta + h * k3theta, x + h, polar_sign)
+    for index in 1:steps
+        fraction_left = (index - 1) / steps
+        fraction_right = index / steps
+        parameter = muladd(fraction_left,
+                           parameter_stop - parameter_start,
+                           parameter_start)
+        parameter_next = index == steps ? parameter_stop :
+                         muladd(fraction_right,
+                                parameter_stop - parameter_start,
+                                parameter_start)
+        h = parameter_next - parameter
+        k1theta, k1phi = rhs(theta, parameter, polar_sign)
+        k2theta, k2phi = rhs(theta + h * k1theta / 2, parameter + h / 2, polar_sign)
+        k3theta, k3phi = rhs(theta + h * k2theta / 2, parameter + h / 2, polar_sign)
+        k4theta, k4phi = rhs(theta + h * k3theta, parameter_next, polar_sign)
         theta += h * (k1theta + 2k2theta + 2k3theta + k4theta) / 6
         phi += h * (k1phi + 2k2phi + 2k3phi + k4phi) / 6
         theta, polar_sign = reflect(theta, polar_sign)
-        x += h
     end
     return (theta=theta, phi=phi, theta_sign=polar_sign)
 end
