@@ -19,14 +19,11 @@ export UnboundSpectrumConfig,
        automatic_frequency_window,
        logarithmic_frequency_grid,
        hybrid_frequency_grid,
-       fft_aligned_frequency_grid,
-       fft_sparse_frequency_grid,
        pchip_slopes,
        pchip_values,
        pchip_integral,
        asymptotic_velocity_data,
        soft_frequency_term,
-       soft_time_term,
        run_unbound_spectrum,
        write_spectrum_outputs
 
@@ -50,9 +47,6 @@ Base.@kwdef mutable struct UnboundSpectrumConfig
     frequency_grid::String = "logarithmic"
     logarithmic_fraction::Float64 = 0.42
     interpolation_coordinate::String = "logarithmic"
-    fft_soft_point_count::Int = 16
-    fft_dense_low_bin_count::Int = 8
-    fft_bin_stride::Int = 1
     soft_deviation_tolerance::Float64 = 0.05
     high_endpoint_fraction_tolerance::Float64 = 0.01
 
@@ -89,11 +83,6 @@ Base.@kwdef mutable struct UnboundSpectrumConfig
 
     interpolation_count::Int = 601
     integrate_soft_segment::Bool = true
-    inverse_fft::Bool = false
-    fft_points::Int = 1024
-    time_domain_memory_baseline::String = "symmetric"
-    low_frequency_regular_completion::String = "hold"
-    low_frequency_completion_tolerance::Float64 = 0.02
     progress_callback::Union{Nothing, Function} = nothing
     output_dir::String = joinpath(@__DIR__, "..", "output", "unbound_spectrum")
 end
@@ -108,19 +97,12 @@ function validate_config(cfg::UnboundSpectrumConfig)
         cfg.plunge_anchor_radius > 0 ||
             error("plunge_anchor_radius must be positive")
     end
-    cfg.frequency_grid in ("logarithmic", "hybrid", "fft_aligned", "fft_sparse") ||
-        error("frequency_grid must be logarithmic, hybrid, fft_aligned, or fft_sparse")
+    cfg.frequency_grid in ("logarithmic", "hybrid") ||
+        error("frequency_grid must be logarithmic or hybrid")
     cfg.interpolation_coordinate in ("linear", "logarithmic") ||
         error("interpolation_coordinate must be linear or logarithmic")
-    cfg.frequency_grid in ("fft_aligned", "fft_sparse") && !cfg.inverse_fft &&
-        error("FFT-structured frequency grids require inverse_fft=true")
     cfg.frequency_grid == "hybrid" && cfg.frequency_count < 8 &&
         error("frequency_count must be at least 8")
-    cfg.fft_soft_point_count >= 4 ||
-        error("fft_soft_point_count must be at least four")
-    cfg.fft_dense_low_bin_count >= 1 ||
-        error("fft_dense_low_bin_count must be positive")
-    cfg.fft_bin_stride >= 1 || error("fft_bin_stride must be positive")
     cfg.mode_policy in ("dominant", "explicit", "auto") ||
         error("mode_policy must be dominant, explicit, or auto")
     cfg.mode_policy == "explicit" && isempty(cfg.explicit_modes) &&
@@ -135,31 +117,8 @@ function validate_config(cfg::UnboundSpectrumConfig)
         error("angular_consecutive_shells must be positive")
     cfg.spheroidal_buffer >= 1 || error("spheroidal_buffer must be positive")
     cfg.spheroidal_l_max >= 2 || error("spheroidal_l_max must be at least 2")
-    cfg.inverse_fft && !ispow2(cfg.fft_points) &&
-        error("fft_points must be a power of two")
-    cfg.inverse_fft && cfg.fft_points < 64 &&
-        error("fft_points must be at least 64")
-    cfg.fft_dense_low_bin_count <= div(cfg.fft_points, 2) ||
-        error("fft_dense_low_bin_count exceeds the positive FFT-bin count")
-    minimum_interpolation_count = if cfg.frequency_grid == "fft_aligned"
-        div(cfg.fft_points, 2) + cfg.fft_soft_point_count
-    elseif cfg.frequency_grid == "fft_sparse"
-        fft_sparse_frequency_node_count(
-            cfg.fft_points, cfg.fft_dense_low_bin_count, cfg.fft_bin_stride,
-        ) + cfg.fft_soft_point_count
-    else
-        cfg.frequency_count
-    end
-    cfg.interpolation_count >= minimum_interpolation_count ||
+    cfg.interpolation_count >= cfg.frequency_count ||
         error("interpolation_count is smaller than the number of solved frequency nodes")
-    cfg.low_frequency_regular_completion in
-        ("hold", "taper_to_zero", "linear_extrapolate") ||
-        error("low_frequency_regular_completion must be hold, taper_to_zero, or linear_extrapolate")
-    cfg.time_domain_memory_baseline in
-        ("symmetric", "incoming_zero", "outgoing_zero") ||
-        error("time_domain_memory_baseline must be symmetric, incoming_zero, or outgoing_zero")
-    cfg.low_frequency_completion_tolerance > 0 ||
-        error("low_frequency_completion_tolerance must be positive")
     cfg.r_outer_floor > 0 || error("r_outer_floor must be positive")
     cfg.r_outer_cap >= cfg.r_outer_floor ||
         error("r_outer_cap must not be smaller than r_outer_floor")
@@ -302,59 +261,6 @@ function logarithmic_frequency_grid(omega_min::Real,
                               length=count)))
 end
 
-function fft_aligned_frequency_grid(omega_min::Real,
-                                    omega_max::Real,
-                                    fft_points::Int,
-                                    soft_point_count::Int)
-    ispow2(fft_points) || error("fft_points must be a power of two")
-    fft_points >= 64 || error("fft_points must be at least 64")
-    soft_point_count >= 4 || error("soft_point_count must be at least four")
-    0 < omega_min < omega_max || error("invalid positive frequency interval")
-    domega = 2Float64(omega_max) / fft_points
-    soft_max = 0.9domega
-    omega_min < soft_max || error(
-        "omega_min must lie below 0.9 times the first positive IFFT bin",
-    )
-    soft = collect(exp.(range(log(Float64(omega_min)), log(soft_max);
-                               length=soft_point_count)))
-    fft_nodes = domega .* collect(1:div(fft_points, 2))
-    return vcat(soft, fft_nodes)
-end
-
-function fft_sparse_frequency_node_count(fft_points::Int,
-                                         dense_low_bin_count::Int,
-                                         bin_stride::Int)
-    maximum_bin = div(fft_points, 2)
-    1 <= dense_low_bin_count <= maximum_bin ||
-        error("invalid dense low-bin count")
-    bin_stride >= 1 || error("bin stride must be positive")
-    bins = collect(1:dense_low_bin_count)
-    append!(bins, collect((dense_low_bin_count + 1):bin_stride:maximum_bin))
-    last(bins) == maximum_bin || push!(bins, maximum_bin)
-    return length(unique(bins))
-end
-
-function fft_sparse_frequency_grid(omega_min::Real,
-                                   omega_max::Real,
-                                   fft_points::Int,
-                                   soft_point_count::Int,
-                                   dense_low_bin_count::Int,
-                                   bin_stride::Int)
-    direct = fft_aligned_frequency_grid(
-        omega_min, omega_max, fft_points, soft_point_count,
-    )
-    soft = direct[1:soft_point_count]
-    domega = 2Float64(omega_max) / fft_points
-    maximum_bin = div(fft_points, 2)
-    1 <= dense_low_bin_count <= maximum_bin ||
-        error("invalid dense low-bin count")
-    bin_stride >= 1 || error("bin stride must be positive")
-    bins = collect(1:dense_low_bin_count)
-    append!(bins, collect((dense_low_bin_count + 1):bin_stride:maximum_bin))
-    last(bins) == maximum_bin || push!(bins, maximum_bin)
-    return vcat(soft, domega .* unique(bins))
-end
-
 unit_radial(theta, phi) =
     (sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta))
 
@@ -455,19 +361,6 @@ function soft_frequency_term(delta_h::Complex, omega::Real)
     return ComplexF64(SN_MEMORY_SIGN * 1im * delta_h / (2pi * omega))
 end
 
-function soft_time_term(delta_h::Complex, time::Real)
-    time == 0 && return 0.0 + 0.0im
-    return ComplexF64(SN_MEMORY_SIGN * sign(time) * delta_h / 2)
-end
-
-function memory_baseline_offset(delta_h::Complex, baseline::String)
-    baseline == "symmetric" && return 0.0 + 0.0im
-    half_jump = ComplexF64(SN_MEMORY_SIGN * delta_h / 2)
-    baseline == "incoming_zero" && return half_jump
-    baseline == "outgoing_zero" && return -half_jump
-    error("unknown time-domain memory baseline: $baseline")
-end
-
 const ScatteringOrbitCache =
     FR.EquatorialScatteringSource.ScatteringOrbitCache
 
@@ -486,6 +379,14 @@ ModeComputationCache(orbit) = ModeComputationCache(
     Dict{Tuple{Int, Int, Float64}, Any}(),
     Dict{Tuple{Int, Int, Float64}, Any}(),
 )
+
+function frequency_anchor_event(cache::ModeComputationCache,
+                                cfg::UnboundSpectrumConfig,
+                                omega::Float64,
+                                anchor)
+    isnan(anchor.radius) && return anchor
+    return plunge_anchor_event(cfg, frequency_orbit!(cache, cfg, omega))
+end
 
 function frequency_outer_radius(cfg::UnboundSpectrumConfig,
                                 omega::Float64)
@@ -511,7 +412,6 @@ end
 function frequency_orbit!(cache::ModeComputationCache,
                           cfg::UnboundSpectrumConfig,
                           omega::Float64)
-    cfg.orbit_kind == "plunge" && return cache.orbit
     target_outer = frequency_outer_radius(cfg, omega)
     target_outer >= cache.orbit.r_outer * (1 - 1e-12) && return cache.orbit
     return get!(cache.frequency_orbits, target_outer) do
@@ -853,9 +753,8 @@ function compute_mode_batch!(worker_caches::Dict{Tuple{Int, Int}, ModeComputatio
                               anchor,
                               modes)
     groups = group_modes_by_m(modes)
-    for group in groups, frequency_index in eachindex(frequencies), branch in 1:2
-        key = branch == 1 ? (group.m, frequency_index) :
-                            (-group.m, -frequency_index)
+    for group in groups, frequency_index in eachindex(frequencies)
+        key = (group.m, frequency_index)
         haskey(worker_caches, key) ||
             (worker_caches[key] = mode_worker_cache(base_cache))
     end
@@ -871,10 +770,9 @@ function compute_mode_batch!(worker_caches::Dict{Tuple{Int, Int}, ModeComputatio
         [Vector{Any}(undef, length(frequencies)) for _ in group.modes]
         for group in groups
     ]
-    jobs = [(group_index, frequency_index, branch)
+    jobs = [(group_index, frequency_index)
             for group_index in eachindex(groups)
-            for frequency_index in eachindex(frequencies)
-            for branch in 1:2]
+            for frequency_index in eachindex(frequencies)]
     parallel = Threads.nthreads() > 1 && length(jobs) > 1
     completed_jobs = Ref(0)
     progress_lock = ReentrantLock()
@@ -884,7 +782,7 @@ function compute_mode_batch!(worker_caches::Dict{Tuple{Int, Int}, ModeComputatio
         isnothing(callback) && return nothing
         lock(progress_lock) do
             completed_jobs[] += 1
-            callback(completed_jobs[], length(jobs), (
+            callback(completed_jobs[], 2 * length(jobs), (
                 m=signed_m,
                 omega=signed_omega,
                 mode_count=mode_count,
@@ -896,26 +794,33 @@ function compute_mode_batch!(worker_caches::Dict{Tuple{Int, Int}, ModeComputatio
     end
 
     function compute_job!(job_index)
-        group_index, frequency_index, branch = jobs[job_index]
+        group_index, frequency_index = jobs[job_index]
         group = groups[group_index]
         omega = Float64(frequencies[frequency_index])
-        signed_m = branch == 1 ? group.m : -group.m
-        signed_omega = branch == 1 ? omega : -omega
-        cache_key = branch == 1 ? (group.m, frequency_index) :
-                                  (-group.m, -frequency_index)
+        cache_key = (group.m, frequency_index)
         local_cache = worker_caches[cache_key]
-        output = branch == 1 ? positive_by_group : conjugate_by_group
-        for mode_index in eachindex(group.modes)
-            ell, _ = group.modes[mode_index]
-            raw = spherical_mode!(
-                local_cache, cfg, ell, signed_m, signed_omega,
+        for branch in 1:2
+            signed_m = branch == 1 ? group.m : -group.m
+            signed_omega = branch == 1 ? omega : -omega
+            output = branch == 1 ? positive_by_group : conjugate_by_group
+            local_anchor = frequency_anchor_event(
+                local_cache, cfg, signed_omega, anchor,
             )
-            output[group_index][mode_index][frequency_index] =
-                anchor_spherical_mode(raw, signed_m, signed_omega, anchor)
+            for mode_index in eachindex(group.modes)
+                ell, _ = group.modes[mode_index]
+                raw = spherical_mode!(
+                    local_cache, cfg, ell, signed_m, signed_omega,
+                )
+                output[group_index][mode_index][frequency_index] =
+                    anchor_spherical_mode(raw, signed_m, signed_omega, local_anchor)
+            end
+            report_progress!(signed_m, signed_omega, length(group.modes),
+                             minimum(first.(group.modes)),
+                             maximum(first.(group.modes)))
         end
-        report_progress!(signed_m, signed_omega, length(group.modes),
-                         minimum(first.(group.modes)),
-                         maximum(first.(group.modes)))
+        empty!(local_cache.frequency_orbits)
+        local_cache.frequency_orbits[Float64(local_cache.orbit.r_outer)] =
+            local_cache.orbit
     end
 
     if parallel
@@ -1000,18 +905,7 @@ function run_unbound_spectrum(cfg::UnboundSpectrumConfig; write_output::Bool=tru
     )
     probe_cache = FR.build_fast_reduced_orbit_cache(probe_cfg)
     window = automatic_frequency_window(cfg, probe_cache)
-    frequencies = if cfg.frequency_grid == "fft_aligned"
-        fft_aligned_frequency_grid(
-            window.omega_min, window.omega_max, cfg.fft_points,
-            cfg.fft_soft_point_count,
-        )
-    elseif cfg.frequency_grid == "fft_sparse"
-        fft_sparse_frequency_grid(
-            window.omega_min, window.omega_max, cfg.fft_points,
-            cfg.fft_soft_point_count, cfg.fft_dense_low_bin_count,
-            cfg.fft_bin_stride,
-        )
-    elseif cfg.frequency_grid == "hybrid"
+    frequencies = if cfg.frequency_grid == "hybrid"
         hybrid_frequency_grid(
             window.omega_min,
             window.omega_max,
@@ -1156,7 +1050,6 @@ function run_unbound_spectrum(cfg::UnboundSpectrumConfig; write_output::Bool=tru
     )
     if write_output
         write_spectrum_outputs(cfg.output_dir, result)
-        cfg.inverse_fft && write_time_domain_outputs(cfg.output_dir, result)
     end
     return result
 end
@@ -1271,12 +1164,6 @@ function write_spectrum_outputs(output_dir, result)
                 result.config.soft_deviation_tolerance)
         @printf(io, "high_endpoint_fraction_tolerance=%.17g\n",
                 result.config.high_endpoint_fraction_tolerance)
-        @printf(io, "low_frequency_regular_completion=%s\n",
-                result.config.low_frequency_regular_completion)
-        @printf(io, "low_frequency_completion_cutoff=%.17g\n",
-                first(result.frequencies))
-        @printf(io, "low_frequency_completion_tolerance=%.17g\n",
-                result.config.low_frequency_completion_tolerance)
         @printf(io, "total_energy_over_mu2E2=%.17g\n",
                 result.total_energy_over_mu2E2)
         @printf(io, "compute_backend=CPU\n")
@@ -1294,263 +1181,6 @@ function write_spectrum_outputs(output_dir, result)
                 result.timings.interpolation_seconds)
     end
     return output_dir
-end
-
-function radix2_negative_dft(values::Vector{ComplexF64})
-    n = length(values)
-    ispow2(n) || error("radix-2 transform requires a power-of-two length")
-    output = copy(values)
-    j = 0
-    for i in 0:(n - 1)
-        i < j && ((output[i + 1], output[j + 1]) =
-                  (output[j + 1], output[i + 1]))
-        bit = n >> 1
-        while bit > 0 && (j & bit) != 0
-            j &= ~bit
-            bit >>= 1
-        end
-        j |= bit
-    end
-    span = 2
-    while span <= n
-        root = cis(-2pi / span)
-        for start in 1:span:n
-            phase = 1.0 + 0.0im
-            half = span >> 1
-            for offset in 0:(half - 1)
-                even = output[start + offset]
-                odd = phase * output[start + offset + half]
-                output[start + offset] = even + odd
-                output[start + offset + half] = even - odd
-                phase *= root
-            end
-        end
-        span <<= 1
-    end
-    return output
-end
-
-function cpu_negative_dft_rows(values::Matrix{ComplexF64})
-    output = similar(values)
-    if Threads.nthreads() > 1 && size(values, 1) > 1
-        Threads.@threads :static for row in axes(values, 1)
-            output[row, :] .= radix2_negative_dft(vec(values[row, :]))
-        end
-    else
-        for row in axes(values, 1)
-            output[row, :] .= radix2_negative_dft(vec(values[row, :]))
-        end
-    end
-    return output
-end
-
-function soft_subtracted_frequency_bins(frequencies,
-                                        positive_values,
-                                        negative_values,
-                                        delta_h::Complex,
-                                        n::Int;
-                                        low_frequency_regular_completion::String="hold",
-                                        interpolation_coordinate::String="linear")
-    length(frequencies) == length(positive_values) == length(negative_values) ||
-        error("signed-frequency sample arrays have different lengths")
-    omega_max = frequencies[end]
-    domega = 2omega_max / n
-    taper_start = 0.9omega_max
-    high_taper(omega) = omega <= taper_start ? 1.0 :
-        0.5 * (1 + cos(pi * (omega - taper_start) /
-                       (omega_max - taper_start)))
-    positive_regular = ComplexF64[
-        positive_values[i] - soft_frequency_term(delta_h, frequencies[i])
-        for i in eachindex(frequencies)
-    ]
-    negative_regular = ComplexF64[
-        negative_values[i] - soft_frequency_term(delta_h, -frequencies[i])
-        for i in eachindex(frequencies)
-    ]
-    low_frequency_regular_completion in
-        ("hold", "taper_to_zero", "linear_extrapolate") ||
-        error("low_frequency_regular_completion must be hold, taper_to_zero, or linear_extrapolate")
-    endpoint_taper(x) = x <= 0 ? 0.0 : x >= 1 ? 1.0 : x^2 * (3 - 2x)
-    function regular_value(values, omega)
-        if omega <= frequencies[1]
-            if low_frequency_regular_completion == "taper_to_zero"
-                return values[1] * endpoint_taper(omega / frequencies[1])
-            elseif low_frequency_regular_completion == "linear_extrapolate"
-                slope = (values[2] - values[1]) /
-                        (frequencies[2] - frequencies[1])
-                return values[1] + (omega - frequencies[1]) * slope
-            end
-            return values[1]
-        end
-        return interpolate_complex(
-            frequencies, values, (omega,);
-            coordinate=interpolation_coordinate,
-        )[1]
-    end
-
-    bins = zeros(ComplexF64, n)
-    bins[1] = 0.5 * (regular_value(positive_regular, 0.0) +
-                     regular_value(negative_regular, 0.0))
-    for k in 1:(n >> 1)
-        omega = k * domega
-        omega <= omega_max || continue
-        bins[k + 1] = regular_value(positive_regular, omega) * high_taper(omega)
-    end
-    for k in 1:((n >> 1) - 1)
-        omega = k * domega
-        omega <= omega_max || continue
-        bins[n - k + 1] = regular_value(negative_regular, omega) * high_taper(omega)
-    end
-    return bins
-end
-
-function soft_subtracted_inverse_mode(frequencies,
-                                      positive_values,
-                                      negative_values,
-                                      delta_h::Complex,
-                                      n::Int;
-                                      low_frequency_regular_completion::String="hold",
-                                      interpolation_coordinate::String="linear")
-    bins = soft_subtracted_frequency_bins(
-        frequencies, positive_values, negative_values, delta_h, n;
-        low_frequency_regular_completion=low_frequency_regular_completion,
-        interpolation_coordinate=interpolation_coordinate,
-    )
-    omega_max = frequencies[end]
-    domega = 2omega_max / n
-    dt = 2pi / (n * domega)
-    regular_unshifted = domega .* radix2_negative_dft(bins)
-    regular = vcat(
-        regular_unshifted[(n >> 1) + 1:end],
-        regular_unshifted[1:(n >> 1)],
-    )
-    times = Float64[(index - 1 - (n >> 1)) * dt for index in 1:n]
-    memory = ComplexF64[soft_time_term(delta_h, time) for time in times]
-    return (times=times, regular=regular, memory=memory,
-            total=regular + memory)
-end
-
-function write_time_domain_outputs(output_dir, result)
-    cfg = result.config
-    n = cfg.fft_points
-    omega_max = result.frequencies[end]
-    domega = 2omega_max / n
-    dt = 2pi / (n * domega)
-    modes = sort(collect(result.spectra); by=first)
-    bins = zeros(ComplexF64, length(modes), n)
-    memories = Vector{ComplexF64}(undef, length(modes))
-    completion_inputs = Vector{Any}(undef, length(modes))
-    for (mode_index, ((ell, m), spectrum)) in enumerate(modes)
-        positive_rows = spectrum.rows
-        companion = get(result.spectra, (ell, -m), nothing)
-        negative_same_m = if isnothing(companion)
-            values = ComplexF64[]
-            for omega in result.frequencies
-                negative_mode = spherical_mode!(
-                    result.spheroidal_cache, cfg, ell, m, -omega,
-                )
-                push!(values, anchor_spherical_mode(
-                    negative_mode, m, -omega, result.plunge_anchor,
-                ).value)
-            end
-            values
-        else
-            ComplexF64[getproperty(row, :h_conjugate) for row in companion.rows]
-        end
-        positive_values = getproperty.(positive_rows, :h_positive)
-        memories[mode_index] = spectrum.memory.positive
-        completion_inputs[mode_index] = (
-            positive_values=positive_values,
-            negative_values=negative_same_m,
-            delta_h=memories[mode_index],
-        )
-        bins[mode_index, :] .= soft_subtracted_frequency_bins(
-            result.frequencies,
-            positive_values,
-            negative_same_m,
-            memories[mode_index],
-            n,
-            low_frequency_regular_completion=cfg.low_frequency_regular_completion,
-            interpolation_coordinate=cfg.interpolation_coordinate,
-        )
-    end
-    transformed = cpu_negative_dft_rows(bins)
-    rows = NamedTuple[]
-    completion_rows = NamedTuple[]
-    for (mode_index, ((ell, m), _)) in enumerate(modes)
-        regular_unshifted = domega .* vec(transformed[mode_index, :])
-        regular = vcat(
-            regular_unshifted[(n >> 1) + 1:end],
-            regular_unshifted[1:(n >> 1)],
-        )
-        delta_h = memories[mode_index]
-        memory_offset = memory_baseline_offset(
-            delta_h, cfg.time_domain_memory_baseline,
-        )
-        completion_input = completion_inputs[mode_index]
-        completion_models = ("hold", "taper_to_zero", "linear_extrapolate")
-        completion_differences = Dict{String, Float64}()
-        for model in completion_models
-            if model == cfg.low_frequency_regular_completion
-                completion_differences[model] = 0.0
-                continue
-            end
-            alternate = soft_subtracted_inverse_mode(
-                result.frequencies,
-                completion_input.positive_values,
-                completion_input.negative_values,
-                completion_input.delta_h,
-                n;
-                low_frequency_regular_completion=model,
-                interpolation_coordinate=cfg.interpolation_coordinate,
-            ).regular
-            completion_differences[model] = maximum(abs.(alternate .- regular))
-        end
-        completion_spread = maximum(values(completion_differences))
-        completion_relative_spread = completion_spread / max(abs(delta_h), eps(Float64))
-        push!(completion_rows, (
-            spherical_l=ell,
-            m=m,
-            selected_model=cfg.low_frequency_regular_completion,
-            cutoff_frequency=first(result.frequencies),
-            max_difference_to_hold=completion_differences["hold"],
-            max_difference_to_taper_to_zero=completion_differences["taper_to_zero"],
-            max_difference_to_linear_extrapolate=completion_differences["linear_extrapolate"],
-            max_relative_difference_to_memory=completion_relative_spread,
-            tolerance=cfg.low_frequency_completion_tolerance,
-            completion_stable=completion_relative_spread <= cfg.low_frequency_completion_tolerance,
-        ))
-        for index in eachindex(regular)
-            time = (index - 1 - (n >> 1)) * dt
-            memory = soft_time_term(delta_h, time) + memory_offset
-            total = regular[index] + memory
-            push!(rows, (
-                spherical_l=ell, m=m, time=time,
-                re_h_regular=real(regular[index]),
-                im_h_regular=imag(regular[index]),
-                re_h_memory=real(memory),
-                im_h_memory=imag(memory),
-                re_h=real(total), im_h=imag(total),
-            ))
-        end
-    end
-    write_rows(joinpath(output_dir, "spherical_time_modes.csv"),
-        (:spherical_l, :m, :time,
-         :re_h_regular, :im_h_regular,
-         :re_h_memory, :im_h_memory,
-         :re_h, :im_h), rows)
-    write_rows(joinpath(output_dir, "time_domain_completion_diagnostics.csv"),
-        (:spherical_l, :m, :selected_model, :cutoff_frequency,
-         :max_difference_to_hold, :max_difference_to_taper_to_zero,
-         :max_difference_to_linear_extrapolate,
-         :max_relative_difference_to_memory, :tolerance,
-         :completion_stable), completion_rows)
-    raw_keys = sort(collect(keys(result.spheroidal_cache.metadata)))
-    raw_modes = Any[result.spheroidal_cache.metadata[key] for key in raw_keys]
-    FR.write_fast_reduced_waveform_rows_csv(
-        joinpath(output_dir, "spheroidal_modes.csv"), raw_modes,
-    )
-    return rows
 end
 
 end
