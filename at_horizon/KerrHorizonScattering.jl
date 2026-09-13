@@ -41,6 +41,7 @@ export HorizonScatteringConfig,
        direct_cancellation_condition,
        horizon_frequency_spectrum,
        horizon_spectrum_diagnostics,
+       write_horizon_spectrum_csv,
        horizon_frequency_grid,
        solve_horizon_spectrum,
        build_direct_orbit_cache,
@@ -1619,6 +1620,100 @@ function horizon_spectrum_diagnostics(
             row.max_cancellation_condition for row in result.rows
         ),
     )
+end
+
+"""
+    write_horizon_spectrum_csv(path, result)
+
+Write the frequency-domain diagnostics from `solve_horizon_spectrum` as a
+flat, one-row-per-`(omega, ell, m)` CSV.  The solver itself remains no-I/O;
+call this explicitly when a persistent diagnostic artifact is required.
+"""
+function write_horizon_spectrum_csv(path::AbstractString, result)
+    hasproperty(result, :spectrum) ||
+        error("write_horizon_spectrum_csv expects solve_horizon_spectrum output")
+    hasproperty(result, :diagnostics) ||
+        error("spectrum result does not contain diagnostics")
+
+    spectrum = result.spectrum
+    diagnostics = result.diagnostics
+    length(spectrum.rows) == length(diagnostics.frequencies) ||
+        error("spectrum and diagnostic frequency rows are inconsistent")
+
+    directory = dirname(abspath(path))
+    isdir(directory) || mkpath(directory)
+    open(path, "w") do io
+        println(io,
+            "omega,ell,m,re_lambda,im_lambda,re_Z_H_minus2,im_Z_H_minus2," *
+            "re_Psi_H,im_Psi_H,re_shear_H,im_shear_H,omega_h,k," *
+            "starobinsky_abs2,absorption_factor,dE_H_domega," *
+            "dE_H_domega_shear,dJ_H_domega,dA_H_domega," *
+            "flux_relative_difference,direct_cancellation_condition," *
+            "wronskian_relative_spread,wronskian_relative_offset," *
+            "shell_dE_H_domega,shell_dJ_H_domega,shell_dA_H_domega," *
+            "shell_absolute_signed_energy_norm,shell_fraction," *
+            "shell_below_tolerance,shell_consecutive_below," *
+            "shell_energy_weighted_cancellation_condition," *
+            "shell_max_cancellation_condition," *
+            "frequency_signed_positive_dE_H_domega," *
+            "frequency_reality_completed_one_sided_dE_H_domega," *
+            "frequency_multipole_converged," *
+            "frequency_energy_weighted_cancellation_condition," *
+            "frequency_max_cancellation_condition,high_endpoint_fraction," *
+            "high_endpoint_fraction_tolerance,high_endpoint_pass," *
+            "endpoint_sequence_pass,accepted_direct_omega_max," *
+            "first_conditioning_failure_omega,status",
+        )
+        for (frequency_row, diagnostic_row) in zip(
+            spectrum.rows, diagnostics.frequencies,
+        )
+            length(frequency_row.shells) == length(diagnostic_row.shell_diagnostics) ||
+                error("shell diagnostics are inconsistent at omega=$(frequency_row.omega)")
+            for (shell, shell_diagnostic) in zip(
+                frequency_row.shells, diagnostic_row.shell_diagnostics,
+            )
+                for mode in shell.modes
+                    physical = mode.result
+                    radial = physical.teukolsky
+                    fields = (
+                        mode.omega, mode.ell, mode.m,
+                        real(radial.lambda), imag(radial.lambda),
+                        real(radial.z_h_minus2), imag(radial.z_h_minus2),
+                        real(physical.Psi_h), imag(physical.Psi_h),
+                        real(physical.shear_h), imag(physical.shear_h),
+                        physical.omega_h, physical.k, physical.starobinsky_abs2,
+                        physical.absorption_factor, physical.dE_domega,
+                        physical.dE_domega_shear, physical.dJ_domega,
+                        physical.dA_domega, physical.flux_relative_difference,
+                        mode.cancellation_condition,
+                        radial.wronskian_relative_spread,
+                        radial.wronskian_relative_offset,
+                        shell.dE_domega, shell.dJ_domega, shell.dA_domega,
+                        shell_diagnostic.absolute_signed_energy_norm,
+                        shell_diagnostic.shell_fraction,
+                        shell_diagnostic.below_tolerance,
+                        shell_diagnostic.consecutive_below,
+                        shell.energy_weighted_cancellation_condition,
+                        shell.max_cancellation_condition,
+                        frequency_row.signed_positive_frequency_dE_domega,
+                        frequency_row.reality_completed_one_sided_dE_domega,
+                        diagnostic_row.multipole_converged,
+                        diagnostic_row.energy_weighted_cancellation_condition,
+                        diagnostic_row.max_cancellation_condition,
+                        diagnostics.high_endpoint_fraction,
+                        diagnostics.high_endpoint_fraction_tolerance,
+                        diagnostics.high_endpoint_pass,
+                        result.endpoint_sequence_pass,
+                        result.accepted_direct_omega_max,
+                        result.first_conditioning_failure_omega,
+                        result.status,
+                    )
+                    println(io, join(string.(fields), ','))
+                end
+            end
+        end
+    end
+    return abspath(path)
 end
 
 
